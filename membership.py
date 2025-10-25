@@ -630,89 +630,93 @@ class Daemon:
         self.log("Control server listening on 127.0.0.1:9900")
 
         while True:
-            conn, address = control_sock.accept()
-            with conn:
-                data = conn.recv(4096).decode("utf-8").strip()
-                if not data:
-                    continue
+            try:
+                conn, address = control_sock.accept()
+                with conn:
+                    data = conn.recv(4096).decode("utf-8").strip()
+                    if not data:
+                        continue
 
-                data_split = data.split()
-                cmd = data_split[0].upper()
+                    data_split = data.split()
+                    cmd = data_split[0].upper()
 
-                if cmd == "SWITCH":
-                    mode_param = data_split[1].lower()
-                    suspicion_param = data_split[2].lower()
-                    if mode_param == "ping":
-                        mode_param = "pingack"
-                    self.mode = mode_param
+                    if cmd == "SWITCH":
+                        mode_param = data_split[1].lower()
+                        suspicion_param = data_split[2].lower()
+                        if mode_param == "ping":
+                            mode_param = "pingack"
+                        self.mode = mode_param
 
-                    if suspicion_param == "suspect":
-                        self.suspicion_enabled = True
-                    else:
-                        self.suspicion_enabled = False
-                    self.log(f"Control: switched mode to {self.mode}, suspicion {self.suspicion_enabled}")
-                    conn.sendall(b"OK\n")
-
-                elif cmd == "DROP" and len(data_split) == 2:
-                    try:
-                        drop_num = float(data_split[1])
-                        drop_num = max(0.0, min(1.0, drop_num))
-                        self.drop = drop_num
-                        self.log(f"Control: drop rate set to {self.drop}")
+                        if suspicion_param == "suspect":
+                            self.suspicion_enabled = True
+                        else:
+                            self.suspicion_enabled = False
+                        self.log(f"Control: switched mode to {self.mode}, suspicion {self.suspicion_enabled}")
                         conn.sendall(b"OK\n")
-                    except Exception:
-                        conn.sendall(b"ERR invalid drop value\n")
 
-                elif cmd == "LEAVE":
-                    self.send_leave_msg()
-                    self.log("Control: node leaving on request")
-                    conn.sendall(b"Node Left\n")
+                    elif cmd == "DROP" and len(data_split) == 2:
+                        try:
+                            drop_num = float(data_split[1])
+                            drop_num = max(0.0, min(1.0, drop_num))
+                            self.drop = drop_num
+                            self.log(f"Control: drop rate set to {self.drop}")
+                            conn.sendall(b"OK\n")
+                        except Exception:
+                            conn.sendall(b"ERR invalid drop value\n")
 
-                elif cmd == "LIST_MEM":
-                    with self.lock:
-                        mem_list = ""
-                        for m in self.members.values():
-                            mem_list += f"Member {m.id}: status={m.status}, incarnation={m.incarnation}\n"
-                    conn.sendall((mem_list + "\n").encode())
+                    elif cmd == "LEAVE":
+                        self.send_leave_msg()
+                        self.log("Control: node leaving on request")
+                        conn.sendall(b"Node Left\n")
 
-                elif cmd == "LIST_SELF":
-                    conn.sendall((self.id + "\n").encode())
+                    elif cmd == "LIST_MEM":
+                        with self.lock:
+                            mem_list = ""
+                            for m in self.members.values():
+                                mem_list += f"Member {m.id}: status={m.status}, incarnation={m.incarnation}\n"
+                        conn.sendall((mem_list + "\n").encode())
 
-                elif cmd == "JOIN":
-                    if self.id in self.members:
-                        conn.sendall(b"Already joined\n")
+                    elif cmd == "LIST_SELF":
+                        conn.sendall((self.id + "\n").encode())
+
+                    elif cmd == "JOIN":
+                        if self.id in self.members:
+                            conn.sendall(b"Already joined\n")
+                        else:
+                            self.send_join()
+                            conn.sendall(b"Join request sent\n")
+
+                    elif cmd == "DISPLAY_SUSPECTS":
+                        with self.lock:
+                            suspects = ""
+                            for m in self.members.values():
+                                if self.members[m.id].status == "suspect":
+                                    suspects += f"{m.id}\n"
+                        conn.sendall(("\n".join(suspects) + "\n").encode())
+
+                    elif cmd == "DISPLAY_PROTOCOL":
+                        if self.suspicion_enabled:
+                            suspicion_str = "suspect"
+                        else:
+                            suspicion_str = "nosuspect"
+
+                        mode_map = {
+                            "gossip": "gossip",
+                            "ping": "ping",          
+                            "pingack": "ping",     
+                        }
+                        mode_str = mode_map.get(self.mode, str(self.mode))
+
+                        combined = f"<{mode_str}, {suspicion_str}>\n"
+                        conn.sendall(combined.encode())
+
                     else:
-                        self.send_join()
-                        conn.sendall(b"Join request sent\n")
-
-                elif cmd == "DISPLAY_SUSPECTS":
-                    with self.lock:
-                        suspects = ""
-                        for m in self.members.values():
-                            if self.members[m.id].status == "suspect":
-                                suspects += f"{m.id}\n"
-                    conn.sendall(("\n".join(suspects) + "\n").encode())
-
-                elif cmd == "DISPLAY_PROTOCOL":
-                    if self.suspicion_enabled:
-                        suspicion_str = "suspect"
-                    else:
-                        suspicion_str = "nosuspect"
-
-                    mode_map = {
-                        "gossip": "gossip",
-                        "ping": "ping",          
-                        "pingack": "ping",     
-                    }
-                    mode_str = mode_map.get(self.mode, str(self.mode))
-
-                    combined = f"<{mode_str}, {suspicion_str}>\n"
-                    conn.sendall(combined.encode())
-
-                else:
-                    conn.sendall(b"ERR unknown command\n")
-         
-                conn.close()
+                        conn.sendall(b"ERR unknown command\n")
+            
+                    conn.close()
+            except Exception as e:
+                import traceback
+                self.log("Control server exception:\n" + traceback.format_exc())
            
     def receiver(self):
         while True:
@@ -776,7 +780,13 @@ def main():
     threading.Thread(target=daemon.failure_checker, daemon=True).start()
     threading.Thread(target=daemon.control_server, daemon=True).start()
 
-    time.sleep(60)
+    # For short lived experiments
+    # time.sleep(60)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("Shutting down Daemon.")
         
     print("\n=== Bandwidth Data ===")
     for timestamp, bw, mode in daemon.bandwidth_data:
