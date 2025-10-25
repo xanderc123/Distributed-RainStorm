@@ -1,0 +1,8 @@
+fa25-cs425-a801.cs.illinois.edu:9000
+fa25-cs425-a802.cs.illinois.edu:9000
+fa25-cs425-a803.cs.illinois.edu:9000
+fa25-cs425-a804.cs.illinois.edu:9000
+fa25-cs425-a805.cs.illinois.edu:9000
+fa25-cs425-a809.cs.illinois.edu:9000
+fa25-cs425-a808.cs.illinois.edu:9000
+fa25-cs425-a810.cs.illinois.edu:9000
