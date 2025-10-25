@@ -3,7 +3,7 @@
 This README contains **copy-pasteable** commands to reproduce the demo on 10 VMs (`fa25-cs425-a801` … `fa25-cs425-a810`) with:
 
 * UDP **port** `9000` (and `9001` only for the rejoin test)
-* **Introducer**: `fa25-cs425-a801.cs.illinois.edu:9000`
+* **Introducer**: `fa25-cs425-9801.cs.illinois.edu:9000`
 * Start in **PingAck without Suspicion**, then switch to **Gossip**, then enable **Suspicion**
 
 > Replace `/path/to/mp2` with your repo path if needed.
@@ -23,13 +23,13 @@ ss -lnup | egrep ':9000' || echo 'no udp 9000'
 
 ## Test 1 — Join (PingAck, No Suspicion)
 
-### Introducer (vm1 = `fa25-cs425-a801.cs.illinois.edu`)
+### Introducer (vm1 = `fa25-cs425-9801.cs.illinois.edu:9000`)
 
 ```bash
 cd /path/to/mp2
 nohup python3 membership.py \
   --port 9000 \
-  --introducer fa25-cs425-a801.cs.illinois.edu:9000 \
+  --introducer fa25-cs425-9801.cs.illinois.edu:9000 \
   --mode pingack --drop 0.0 --t_fail 2 --t_suspect 1.8 --t_cleanup 2 \
   > daemon_vm1.log 2>&1 & echo $! > daemon_vm1.pid
 sleep 1
@@ -46,7 +46,7 @@ Run on **each** of vm2, vm3, vm4, vm5:
 cd /path/to/mp2
 nohup python3 membership.py \
   --port 9000 \
-  --introducer fa25-cs425-a801.cs.illinois.edu:9000 \
+  --introducer fa25-cs425-9801.cs.illinois.edu:9000 \
   --mode pingack --drop 0.0 --t_fail 2 --t_suspect 1.8 --t_cleanup 2 \
   > vm.log 2>&1 & echo $! > vm.pid
 ```
@@ -67,7 +67,7 @@ Run on **each** of vm6, vm7, vm8, vm9, vm10:
 cd /path/to/mp2
 nohup python3 membership.py \
   --port 9000 \
-  --introducer fa25-cs425-a801.cs.illinois.edu:9000 \
+  --introducer fa25-cs425-9801.cs.illinois.edu:9000 \
   --mode pingack --drop 0.0 --t_fail 2 --t_suspect 1.8 --t_cleanup 2 \
   > vm.log 2>&1 & echo $! > vm.pid
 ```
@@ -171,7 +171,7 @@ On **vm7**:
 cd /path/to/mp2
 nohup python3 membership.py \
   --port 9001 \
-  --introducer fa25-cs425-a801.cs.illinois.edu:9000 \
+  --introducer fa25-cs425-9801.cs.illinois.edu:9000 \
   --mode gossip --drop 0.0 --t_fail 2 --t_suspect 1.8 --t_cleanup 2 \
   > vm7_rejoin_p9001.log 2>&1 & echo $! > vm7_rejoin_p9001.pid
 ```
