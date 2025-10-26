@@ -7,6 +7,7 @@ import threading
 import time
 from typing import Dict
 from suspicion import start_suspect, clear_suspect, delete_member
+from ConsistentHash import ConsistentHashRing
 
 class Member:
     def __init__(self, id, heartbeat, last_heard, status, incarnation):
@@ -53,6 +54,12 @@ class Daemon:
         self.last_bw_log = time.monotonic()
         self.control_port = 9900
         self.t_ping = 0.30
+
+        ## MP3
+        self.hash_ring = ConsistentHashRing()
+        if self.id == self.introducer:
+            self.hash_ring.add_node(self.id)
+
 
     def log(self, message: str):
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -674,6 +681,13 @@ class Daemon:
                             mem_list = ""
                             for m in self.members.values():
                                 mem_list += f"Member {m.id}: status={m.status}, incarnation={m.incarnation}\n"
+                        conn.sendall((mem_list + "\n").encode())
+                    
+                    elif cmd == "LIST_MEM_IDS":
+                        with self.lock:
+                            mem_list = ""
+                            for m in self.members.values():
+                                mem_list += f"Member {m.id}, NodeID={self.hash_ring.get_ring_id(m.id)}, status={m.status}, incarnation={m.incarnation}\n"
                         conn.sendall((mem_list + "\n").encode())
 
                     elif cmd == "LIST_SELF":

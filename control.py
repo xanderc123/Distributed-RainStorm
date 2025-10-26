@@ -6,7 +6,7 @@ def main():
     ap.add_argument("--port", type = int, default = 9900, help = "control port (defaults to 9900)")
     ap.add_argument("cmd", choices=[
         "list_mem", "list_self", "join", "leave", "display_suspects", 
-        "switch", "display_protocol", "drop"
+        "switch", "display_protocol", "drop", "list_mem_ids"
     ], help="command")
     ap.add_argument("--timeout", type = float, default = 3.0, help = "socket timeout (s)")
     ap.add_argument("args", nargs="*", help="arguments for commands like switch or drop")
@@ -33,6 +33,9 @@ def main():
 
     elif args.cmd == "list_mem":
         line = "LIST_MEM\n"
+    
+    elif args.cmd == "list_mem_ids":
+        line = "LIST_MEM_IDS\n"
 
     elif args.cmd == "list_self":
         line = "LIST_SELF\n"
