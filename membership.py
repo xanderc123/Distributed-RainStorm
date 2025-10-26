@@ -1,13 +1,17 @@
 import argparse
+import bisect
 from collections import deque
+import hashlib
 import json
 import random
 import socket
+import struct
 import threading
 import time
 from typing import Dict
 from suspicion import start_suspect, clear_suspect, delete_member
-from ConsistentHash import ConsistentHashRing
+import pathlib
+import os
 
 class Member:
     def __init__(self, id, heartbeat, last_heard, status, incarnation):
@@ -55,11 +59,16 @@ class Daemon:
         self.control_port = 9900
         self.t_ping = 0.30
 
-        ## MP3
-        self.hash_ring = ConsistentHashRing()
-        if self.id == self.introducer:
-            self.hash_ring.add_node(self.id)
-
+        # mp3_file_system
+        self.file_system_port = port + 2#udp 9000 then tcp 9002
+        # 2. Define the file storage path (e.g.: ./files_9000/)
+        self.file_storage_path = pathlib.Path(f"files_{self.port}")
+        # Create this directory (if it doesn't exist yet)
+        os.makedirs(self.file_storage_path, exist_ok=True)
+        # 3. Set the replication factor (n=3)
+        self.replication_factor = 3
+        # 4. For rebalancing thread to detect membership changes
+        self.previous_members = set()
 
     def log(self, message: str):
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -87,7 +96,7 @@ class Daemon:
         node_id = incoming.get("id")
         incomingStatus = incoming.get("status")
         incomingIncarnation = incoming.get("incarnation")
-
+        
         if node_id is None or incomingStatus is None or incomingIncarnation is None:
             self.log(f"Skipped update for {incoming} (missing keys)")
             return
@@ -637,100 +646,89 @@ class Daemon:
         self.log("Control server listening on 127.0.0.1:9900")
 
         while True:
-            try:
-                conn, address = control_sock.accept()
-                with conn:
-                    data = conn.recv(4096).decode("utf-8").strip()
-                    if not data:
-                        continue
+            conn, address = control_sock.accept()
+            with conn:
+                data = conn.recv(4096).decode("utf-8").strip()
+                if not data:
+                    continue
 
-                    data_split = data.split()
-                    cmd = data_split[0].upper()
+                data_split = data.split()
+                cmd = data_split[0].upper()
 
-                    if cmd == "SWITCH":
-                        mode_param = data_split[1].lower()
-                        suspicion_param = data_split[2].lower()
-                        if mode_param == "ping":
-                            mode_param = "pingack"
-                        self.mode = mode_param
+                if cmd == "SWITCH":
+                    mode_param = data_split[1].lower()
+                    suspicion_param = data_split[2].lower()
+                    if mode_param == "ping":
+                        mode_param = "pingack"
+                    self.mode = mode_param
 
-                        if suspicion_param == "suspect":
-                            self.suspicion_enabled = True
-                        else:
-                            self.suspicion_enabled = False
-                        self.log(f"Control: switched mode to {self.mode}, suspicion {self.suspicion_enabled}")
-                        conn.sendall(b"OK\n")
-
-                    elif cmd == "DROP" and len(data_split) == 2:
-                        try:
-                            drop_num = float(data_split[1])
-                            drop_num = max(0.0, min(1.0, drop_num))
-                            self.drop = drop_num
-                            self.log(f"Control: drop rate set to {self.drop}")
-                            conn.sendall(b"OK\n")
-                        except Exception:
-                            conn.sendall(b"ERR invalid drop value\n")
-
-                    elif cmd == "LEAVE":
-                        self.send_leave_msg()
-                        self.log("Control: node leaving on request")
-                        conn.sendall(b"Node Left\n")
-
-                    elif cmd == "LIST_MEM":
-                        with self.lock:
-                            mem_list = ""
-                            for m in self.members.values():
-                                mem_list += f"Member {m.id}: status={m.status}, incarnation={m.incarnation}\n"
-                        conn.sendall((mem_list + "\n").encode())
-                    
-                    elif cmd == "LIST_MEM_IDS":
-                        with self.lock:
-                            mem_list = ""
-                            for m in self.members.values():
-                                mem_list += f"Member {m.id}, NodeID={self.hash_ring.get_ring_id(m.id)}, status={m.status}, incarnation={m.incarnation}\n"
-                        conn.sendall((mem_list + "\n").encode())
-
-                    elif cmd == "LIST_SELF":
-                        conn.sendall((self.id + "\n").encode())
-
-                    elif cmd == "JOIN":
-                        if self.id in self.members:
-                            conn.sendall(b"Already joined\n")
-                        else:
-                            self.send_join()
-                            conn.sendall(b"Join request sent\n")
-
-                    elif cmd == "DISPLAY_SUSPECTS":
-                        with self.lock:
-                            suspects = ""
-                            for m in self.members.values():
-                                if self.members[m.id].status == "suspect":
-                                    suspects += f"{m.id}\n"
-                        conn.sendall(("\n".join(suspects) + "\n").encode())
-
-                    elif cmd == "DISPLAY_PROTOCOL":
-                        if self.suspicion_enabled:
-                            suspicion_str = "suspect"
-                        else:
-                            suspicion_str = "nosuspect"
-
-                        mode_map = {
-                            "gossip": "gossip",
-                            "ping": "ping",          
-                            "pingack": "ping",     
-                        }
-                        mode_str = mode_map.get(self.mode, str(self.mode))
-
-                        combined = f"<{mode_str}, {suspicion_str}>\n"
-                        conn.sendall(combined.encode())
-
+                    if suspicion_param == "suspect":
+                        self.suspicion_enabled = True
                     else:
-                        conn.sendall(b"ERR unknown command\n")
-            
-                    conn.close()
-            except Exception as e:
-                import traceback
-                self.log("Control server exception:\n" + traceback.format_exc())
+                        self.suspicion_enabled = False
+                    self.log(f"Control: switched mode to {self.mode}, suspicion {self.suspicion_enabled}")
+                    conn.sendall(b"OK\n")
+
+                elif cmd == "DROP" and len(data_split) == 2:
+                    try:
+                        drop_num = float(data_split[1])
+                        drop_num = max(0.0, min(1.0, drop_num))
+                        self.drop = drop_num
+                        self.log(f"Control: drop rate set to {self.drop}")
+                        conn.sendall(b"OK\n")
+                    except Exception:
+                        conn.sendall(b"ERR invalid drop value\n")
+
+                elif cmd == "LEAVE":
+                    self.send_leave_msg()
+                    self.log("Control: node leaving on request")
+                    conn.sendall(b"Node Left\n")
+
+                elif cmd == "LIST_MEM":
+                    with self.lock:
+                        mem_list = ""
+                        for m in self.members.values():
+                            mem_list += f"Member {m.id}: status={m.status}, incarnation={m.incarnation}\n"
+                    conn.sendall((mem_list + "\n").encode())
+
+                elif cmd == "LIST_SELF":
+                    conn.sendall((self.id + "\n").encode())
+
+                elif cmd == "JOIN":
+                    if self.id in self.members:
+                        conn.sendall(b"Already joined\n")
+                    else:
+                        self.send_join()
+                        conn.sendall(b"Join request sent\n")
+
+                elif cmd == "DISPLAY_SUSPECTS":
+                    with self.lock:
+                        suspects = ""
+                        for m in self.members.values():
+                            if self.members[m.id].status == "suspect":
+                                suspects += f"{m.id}\n"
+                    conn.sendall(("\n".join(suspects) + "\n").encode())
+
+                elif cmd == "DISPLAY_PROTOCOL":
+                    if self.suspicion_enabled:
+                        suspicion_str = "suspect"
+                    else:
+                        suspicion_str = "nosuspect"
+
+                    mode_map = {
+                        "gossip": "gossip",
+                        "ping": "ping",          
+                        "pingack": "ping",     
+                    }
+                    mode_str = mode_map.get(self.mode, str(self.mode))
+
+                    combined = f"<{mode_str}, {suspicion_str}>\n"
+                    conn.sendall(combined.encode())
+
+                else:
+                    conn.sendall(b"ERR unknown command\n")
+         
+                conn.close()
            
     def receiver(self):
         while True:
@@ -758,6 +756,257 @@ class Daemon:
             self.last_bw_log = now
             size = sum(1 for m in self.members.values() if m.status in ("alive", "suspect", "left"))
             self.log(f"EVENT=BW bytes_out_per_s={bw:.2f} mode={self.mode} size={size}")
+            # --- Functions for New Threads (ported from server.py and new requirements) ---
+
+    # Helper functions: ported from server.py for TCP communication
+    def send_tcp(self, sock, obj):
+        data = json.dumps(obj).encode("utf-8")
+        hdr = struct.pack("!I", len(data))
+        sock.sendall(hdr + data)
+
+    def recv_tcp(self, sock, n):
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("connection closed")
+            buf.extend(chunk)
+        return bytes(buf)
+
+    def recv_msg_tcp(self, sock):
+        hdr = self.recv_tcp(sock, 4)
+        (length,) = struct.unpack("!I", hdr)
+        data = self.recv_tcp(sock, length)
+        return json.loads(data.decode("utf-8"))
+
+    # Placeholder: You need to implement this consistent hashing routing function
+    def find_replicas(self, filename: str) -> list:
+        """
+        Implements consistent hashing routing.
+        Based on the current list of alive members, calculates the N (self.replication_factor) replica nodes where the file should be located.
+        
+        """
+        # 1. Create a temporary, sorted list of node hashes
+        sorted_nodes = []
+        alive_node_ids = [] # Store node IDs
+        
+        # Must acquire lock because `self.members` might be modified by other threads (e.g., receiver)
+        with self.lock:
+            # Build the hash ring only from members with 'alive' status
+            alive_members = [m for m in self.members.values() if m.status == 'alive']
+            if not alive_members:
+                return [] # Hash ring is empty
+
+            for m in alive_members:
+                # 2. Calculate hash value for each node
+                # We use SHA-1 and take the first 10 characters (or modulo) to get a manageable integer
+                node_hash = int(hashlib.sha1(m.id.encode('utf-8')).hexdigest(), 16)
+                sorted_nodes.append((node_hash, m.id))
+        
+        # 3. Sort the node hashes
+        sorted_nodes.sort()
+        
+        # Separate hash values and node IDs for easier `bisect` usage
+        node_hashes = [h for h, nid in sorted_nodes]
+        node_ids = [nid for h, nid in sorted_nodes]
+
+        # 4. Calculate the file's hash value
+        file_hash = int(hashlib.sha1(filename.encode('utf-8')).hexdigest(), 16)
+
+        # 5. Find the successor node
+        # `bisect_right` finds the index of the first node with hash greater than file_hash
+        # This is the core lookup operation of consistent hashing
+        start_index = bisect.bisect_right(node_hashes, file_hash)
+        
+        # 6. Handle ring wrap-around
+        # If the hash value is greater than any node on the ring, it belongs to the first node
+        if start_index == len(node_ids):
+            start_index = 0
+
+        # 7. Collect N (self.replication_factor) replicas
+        replicas = []
+        
+        # Ensure we don't error out if there are too few nodes
+        num_nodes = len(node_ids)
+        num_replicas = min(self.replication_factor, num_nodes) #
+        
+        for i in range(num_replicas):
+            # (start_index + i) % num_nodes ensures proper wrapping around the ring
+            index = (start_index + i) % num_nodes
+            replicas.append(node_ids[index])
+            
+        return replicas
+
+    # New Thread 1 logic: Handle file clients (from server.py)
+    def handle_file_client(self, conn, addr):
+        try:
+            # 1. Receive client request (e.g.: {"command": "append", "remote_file": "file.txt", ...})
+            req = self.recv_msg_tcp(conn)
+            command = req.get("command")
+            remote_file = req.get("remote_file") # The HyDFS filename the client wants to operate on
+
+            # 2. Find replicas (consistent hashing)
+            # This step is O(1) routing
+            replicas = self.find_replicas(remote_file)
+            if not replicas:
+                self.send_tcp(conn, {"ok": False, "error": "No nodes available"})
+                return
+
+            # 3. Determine primary replica (Leader)
+            # We agree: the first node on the hash ring (replicas[0]) is the primary replica for this file
+            primary_node_id = replicas[0]
+            follower_node_ids = replicas[1:] # The rest are followers (n=3)
+
+            # 4. Routing logic: Check if this node is the primary replica
+            if self.id != primary_node_id:
+                # [Not primary replica]: Forward request to the real primary replica
+                # This is to satisfy (iii) read-your-writes consistency
+                self.log(f"Forwarding {command} for {remote_file} -> {primary_node_id}")
+                # ... (Implement forwarding logic: connect to primary_node_id, send req) ...
+                # ... (Receive response from primary_node_id and send it back unchanged to original client) ...
+                return
+
+            # 5. Execution logic: [This node is the primary replica]
+            # (At this point, we can ensure all read/write operations go through this node, satisfying (iii) read-your-writes)
+            
+            # --- To satisfy (ii) eventual consistency, primary replica must serialize operations on the same file ---
+            # --- You need a file lock ---
+            with self.get_file_lock(remote_file): # This is a lock function you need to implement
+                
+                if command == "create":
+                    # Check if file already exists
+                    if self.file_exists_locally(remote_file):
+                        self.send_tcp(conn, {"ok": False, "error": "File already exists"})
+                    else:
+                        # 1. Receive file data from client
+                        # 2. Write file locally
+                        # 3. Forward "create" command and file data to all follower_node_ids
+                        # 4. Wait for all followers to acknowledge "OK"
+                        # 5. Send "OK" to original client
+                        self.log(f"CREATE: {remote_file} successful")
+                        self.send_tcp(conn, {"ok": True})
+
+                elif command == "append":
+                    # Check if file exists
+                    if not self.file_exists_locally(remote_file):
+                        self.send_tcp(conn, {"ok": False, "error": "File does not exist"})
+                    else:
+                        # 1. Receive data to append from client
+                        # 2. Append data to local file
+                        # 3. Forward "append" command and appended data to all follower_node_ids
+                        #    (This ensures (ii) eventual consistency because you determine the order)
+                        # 4. Wait for all followers to acknowledge "OK"
+                        # 5. Send "OK" to original client
+                        #    (This ensures (i) client append order)
+                        self.log(f"APPEND: {remote_file} successful")
+                        self.send_tcp(conn, {"ok": True})
+
+                elif command == "get":
+                    #
+                    # (Because we are the primary replica, we guarantee having the latest data)
+                    if not self.file_exists_locally(remote_file):
+                        self.send_tcp(conn, {"ok": False, "error": "File not found"})
+                    else:
+                        # 1. Read file data locally
+                        # 2. Send file data back to client
+                        self.log(f"GET: {remote_file} successful")
+                        self.send_tcp(conn, {"ok": True, "file_data": ...})
+
+                elif command == "merge":
+                    #
+                    # Assumption: No new updates are occurring
+                    # Because primary replica always has the "correct" order (all writes must go through it)
+                    # So the merge logic is: primary replica forces its version to overwrite all followers
+                    
+                    # 1. Read *entire* file content locally
+                    # 2. Send *entire* content to all follower_node_ids (using an internal command like "FORCE_OVERWRITE")
+                    # 3. Wait for followers to acknowledge "OK"
+                    # 4. Send "OK" to client
+                    self.log(f"MERGE: {remote_file} successful")
+                    self.send_tcp(conn, {"ok": True, "message": "Merge complete"})
+                    
+        except Exception as e:
+            self.log(f"Handle file client error: {e}")
+            try:
+                # Ensure client doesn't wait forever
+                self.send_tcp(conn, {"ok": False, "error": str(e)})
+            except:
+                pass # Connection might already be closed
+        finally:
+            conn.close()
+    # New Thread 1 target: File system server (from server.py)
+    def tcp_file_server(self):
+        """
+        This is the target for new thread 1. It listens for file requests on TCP port (e.g., 9002).
+        """
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", self.file_system_port))
+            s.listen(128)
+            self.log(f"[HyDFS Server] Listening for file requests on TCP port {self.file_system_port}...")
+            
+            while True:
+                conn, addr = s.accept()
+                # Start a *new* worker thread for each client connection
+                t = threading.Thread(
+                    target=self.handle_file_client,
+                    args=(conn, addr),
+                    daemon=True
+                )
+                t.start()
+
+    # New Thread 2 target: Rebalance/Replication Manager
+    def replication_manager(self):
+        """
+        This is the target for new thread 2. It periodically checks for membership changes and triggers rebalancing.
+       
+        """
+        self.log("[Replication Manager] Replication manager started.")
+        while True:
+            # 1. Wake up periodically
+            time.sleep(10) # Check every 10 seconds
+
+            current_members = set()
+            try:
+                # 2. Get current list of alive members
+                with self.lock:
+                    current_members = set(m.id for m in self.members.values() if m.status == 'alive')
+                
+                # 3. Check if different from last recorded state
+                if current_members == self.previous_members:
+                    continue # No membership change, skip
+
+                self.log(f"Membership change detected: {len(self.previous_members)} -> {len(current_members)}")
+
+                # --- This is complex logic you need to implement ---
+                # 4. Iterate through all files stored locally on this node
+                local_files = list(self.file_storage_path.glob("*"))
+                if not local_files:
+                    self.log("No local files, rebalancing not needed.")
+                
+                for file_path in local_files:
+                    filename = file_path.name
+                    # 5. Calculate correct replica locations based on *new* list
+                    new_replicas = self.find_replicas(filename)
+                    
+                    # 6. Check if this node needs to move data
+                    if self.id not in new_replicas:
+                        # This node is no longer a replica, should send file to new replicas and delete local file
+                        self.log(f"Rebalancing: {filename} no longer belongs to this node. (not implemented)")
+                        # ... (Implement logic to send file to new_replicas) ...
+                        # os.remove(file_path) # Delete after successful transfer
+
+                    elif self.id == new_replicas[0]: # Assuming this node is primary replica
+                        # This node is still primary replica, need to ensure other replicas have data (re-replication)
+                        self.log(f"Re-replication: Checking replicas {new_replicas} for {filename} (not implemented)")
+                        # ... (Implement logic to check and send file to new_replicas[1] and [2]) ...
+
+                # 7. Update state for next check
+                self.previous_members = current_members
+                self.log("Rebalancing/re-replication check completed.")
+
+            except Exception as e:
+                self.log(f"Replication Manager error: {e}")
 
 def main():
     parser = argparse.ArgumentParser(description="Membership daemon for MP2")
@@ -794,13 +1043,7 @@ def main():
     threading.Thread(target=daemon.failure_checker, daemon=True).start()
     threading.Thread(target=daemon.control_server, daemon=True).start()
 
-    # For short lived experiments
-    # time.sleep(60)
-    try:
-        while True:
-            time.sleep(1)
-    except KeyboardInterrupt:
-        print("Shutting down Daemon.")
+    time.sleep(60)
         
     print("\n=== Bandwidth Data ===")
     for timestamp, bw, mode in daemon.bandwidth_data:
