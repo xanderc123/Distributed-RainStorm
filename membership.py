@@ -827,6 +827,13 @@ class Daemon:
         dst = os.path.join(self.file_storage_dir, remote_file)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         shutil.copy(src, dst)
+    
+    def write_file_from_data(self, filename, data=None):
+        dst_path = os.path.join(self.file_storage_dir, filename)
+        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+        
+        with open(dst_path, "wb") as f:
+            f.write(file_data)
 
     # Placeholder: You need to implement this consistent hashing routing function
     def find_replicas(self, filename: str) -> list:
@@ -996,8 +1003,8 @@ class Daemon:
                     if self.file_exists_locally(remote_file):
                         self.send_tcp(conn, {"ok": False, "error": "[REPLICA] File already exists"})
                     else:
-                        data = {}
-                        self.write_file_locally(local_file, remote_file, data)
+                        file_data = req.get("file_data", "").encode("latin1")
+                        self.write_file_from_data(remote_file, file_data)
                         self.log(f"[REPLICA] CREATE: {remote_file} successful")
                         self.send_tcp(conn, {"ok": True})
                     
