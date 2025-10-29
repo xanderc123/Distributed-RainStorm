@@ -69,6 +69,9 @@ class Daemon:
         self.replication_factor = 3
         # 4. For rebalancing thread to detect membership changes
         self.previous_members = set()
+        # mangage the lock for hydfs file
+        self.global_file_lock = threading.Lock()
+        self.file_locks: Dict[str, threading.Lock] = {}
 
     def log(self, message: str):
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
@@ -778,6 +781,22 @@ class Daemon:
         (length,) = struct.unpack("!I", hdr)
         data = self.recv_tcp(sock, length)
         return json.loads(data.decode("utf-8"))
+    def get_file_lock(self, filename: str) -> threading.Lock:
+        """
+        Atomically acquire or create a file-specific lock
+        to ensure serialization of write operations.
+        """
+        with self.global_file_lock:
+            if filename not in self.file_locks:
+                self.file_locks[filename] = threading.Lock()
+            return self.file_locks[filename]
+
+    def file_exists_locally(self, filename: str) -> bool:
+        """
+        Check if the file exists in the node's local storage path.
+        """
+        local_path = self.file_storage_path / filename
+        return local_path.exists()
 
     # Placeholder: You need to implement this consistent hashing routing function
     def find_replicas(self, filename: str) -> list:
@@ -1042,7 +1061,9 @@ def main():
     threading.Thread(target=daemon.gossip, daemon=True).start()
     threading.Thread(target=daemon.failure_checker, daemon=True).start()
     threading.Thread(target=daemon.control_server, daemon=True).start()
-
+    # --- add new HyDFS threads here ---
+    threading.Thread(target=daemon.tcp_file_server, daemon=True).start()
+    threading.Thread(target=daemon.replication_manager, daemon=True).start()
     time.sleep(60)
         
     print("\n=== Bandwidth Data ===")
