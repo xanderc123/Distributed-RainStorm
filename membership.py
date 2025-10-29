@@ -60,7 +60,7 @@ class Daemon:
         self.t_ping = 0.30
 
         # mp3_file_system
-        self.file_system_port = port + 2#udp 9000 then tcp 9002
+        self.file_system_port = 9002
         # 2. Define the file storage path (e.g.: ./files_9000/)
         self.file_storage_path = pathlib.Path(f"files_{self.port}")
         # Create this directory (if it doesn't exist yet)
@@ -798,6 +798,21 @@ class Daemon:
         local_path = self.file_storage_path / filename
         return local_path.exists()
 
+    def get_sorted_node_hash_list(self):
+        sorted_nodes = []
+        with self.lock:
+            alive_members = [m for m in self.members.values() if m.status == 'alive']
+            if not alive_members:
+                return []
+
+            for m in alive_members:
+                node_hash = int(hashlib.sha1(m.id.encode('utf-8')).hexdigest(), 16)
+                sorted_nodes.append((node_hash, m.id))
+        
+        sorted_nodes.sort()
+        return sorted_nodes
+
+
     # Placeholder: You need to implement this consistent hashing routing function
     def find_replicas(self, filename: str) -> list:
         """
@@ -806,30 +821,12 @@ class Daemon:
         
         """
         # 1. Create a temporary, sorted list of node hashes
-        sorted_nodes = []
+        sorted_nodes = self.get_sorted_node_hash_list()
         alive_node_ids = [] # Store node IDs
         
-        # Must acquire lock because `self.members` might be modified by other threads (e.g., receiver)
-        with self.lock:
-            # Build the hash ring only from members with 'alive' status
-            alive_members = [m for m in self.members.values() if m.status == 'alive']
-            if not alive_members:
-                return [] # Hash ring is empty
-
-            for m in alive_members:
-                # 2. Calculate hash value for each node
-                # We use SHA-1 and take the first 10 characters (or modulo) to get a manageable integer
-                node_hash = int(hashlib.sha1(m.id.encode('utf-8')).hexdigest(), 16)
-                sorted_nodes.append((node_hash, m.id))
-        
-        # 3. Sort the node hashes
-        sorted_nodes.sort()
-        
-        # Separate hash values and node IDs for easier `bisect` usage
         node_hashes = [h for h, nid in sorted_nodes]
         node_ids = [nid for h, nid in sorted_nodes]
 
-        # 4. Calculate the file's hash value
         file_hash = int(hashlib.sha1(filename.encode('utf-8')).hexdigest(), 16)
 
         # 5. Find the successor node
@@ -863,10 +860,14 @@ class Daemon:
             req = self.recv_msg_tcp(conn)
             command = req.get("command")
             remote_file = req.get("remote_file") # The HyDFS filename the client wants to operate on
+            print(f"Command: {command}")
+            print(f"Remote file: {remote_file}")
 
             # 2. Find replicas (consistent hashing)
             # This step is O(1) routing
             replicas = self.find_replicas(remote_file)
+            print(f"Replicas: {replicas}")
+            return
             if not replicas:
                 self.send_tcp(conn, {"ok": False, "error": "No nodes available"})
                 return
@@ -1061,10 +1062,15 @@ def main():
     threading.Thread(target=daemon.gossip, daemon=True).start()
     threading.Thread(target=daemon.failure_checker, daemon=True).start()
     threading.Thread(target=daemon.control_server, daemon=True).start()
-    # --- add new HyDFS threads here ---
-    threading.Thread(target=daemon.tcp_file_server, daemon=True).start()
     threading.Thread(target=daemon.replication_manager, daemon=True).start()
-    time.sleep(60)
+    threading.Thread(target=daemon.tcp_file_server, daemon=True).start()
+
+    # time.sleep(60)
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("Shutting down server")
         
     print("\n=== Bandwidth Data ===")
     for timestamp, bw, mode in daemon.bandwidth_data:

@@ -7,6 +7,8 @@ import random
 import sys
 from typing import Tuple, List
 
+FILE_SERVER_PORT = 9002
+
 # --- TCP helper functions (from MP1 client.py / membership.py) ---
 
 def send(sock, obj):
@@ -83,7 +85,10 @@ def get_connection_info(
         except Exception:
             print(f"Error: Invalid VM address format '{vm_address}'. Must be 'host:port' (e.g., 'fa25-cs425-a801.cs.illinois.edu:9000')", file=sys.stderr)
             sys.exit(1)
-            
+
+    elif command == "create":
+        return ("127.0.0.1", FILE_SERVER_PORT)
+        
     else:
         # All other commands connect to a random node
         if not hosts_list:

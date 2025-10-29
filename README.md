@@ -17,6 +17,7 @@ This README contains **copy-pasteable** commands to reproduce the demo on 10 VMs
 pkill -f "membership.py.*--port 9000" || true
 ss -lnpt | egrep ':9900' || echo 'no control 9900'
 ss -lnup | egrep ':9000' || echo 'no udp 9000'
+ss -lnup | egrep ':9002' || echo 'no file server 9002'
 ```
 
 ---
