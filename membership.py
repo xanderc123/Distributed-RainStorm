@@ -946,6 +946,7 @@ class Daemon:
             # 4. Routing logic: Check if this node is the primary replica
             if self.id != primary_node_id:
                 self.forward_file_to_primary(command, remote_file, local_file, primary_node_id, conn)
+                return
 
             #     # This is to satisfy (iii) read-your-writes consistency
             #     self.log(f"Forwarding {command} for {remote_file} -> {primary_node_id}")
@@ -967,7 +968,7 @@ class Daemon:
                         file_size = req.get("file_size")  # will be None for local case
                         if file_size is not None:
                             # forwarded case → receive stream
-                            dst_path = os.path.join(self.storage_dir, remote_file)
+                            dst_path = os.path.join(self.file_storage_dir, remote_file)
                             self.receive_file_stream(conn, dst_path, int(file_size))
                         else:
                             # local case → just move (keep your existing behavior or use this helper)
