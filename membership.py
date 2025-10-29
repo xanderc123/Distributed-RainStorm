@@ -910,6 +910,18 @@ class Daemon:
 
         return success
 
+    def receive_file_stream(self, conn, dst_path, file_size):
+        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+        remaining = file_size
+        with open(dst_path, "wb") as f:
+            while remaining > 0:
+                chunk = conn.recv(min(64 * 1024, remaining))
+                if not chunk:
+                    break
+                f.write(chunk)
+                remaining -= len(chunk)
+        self.log(f"[RECV] Wrote {file_size - remaining} bytes to {dst_path}")
+
     # New Thread 1 logic: Handle file clients (from server.py)
     def handle_file_client(self, conn, addr):
         try:
@@ -932,8 +944,9 @@ class Daemon:
 
 
             # 4. Routing logic: Check if this node is the primary replica
-            # if self.id != primary_node_id and command != "create_replica":
-            #     # [Not primary replica]: Forward request to the real primary replica
+            if self.id != primary_node_id:
+                self.forward_file_to_primary(command, remote_file, local_file, primary_node_id, conn)
+
             #     # This is to satisfy (iii) read-your-writes consistency
             #     self.log(f"Forwarding {command} for {remote_file} -> {primary_node_id}")
             #     # ... (Implement forwarding logic: connect to primary_node_id, send req) ...
@@ -950,13 +963,17 @@ class Daemon:
                     if self.file_exists_locally(remote_file):
                         self.send_tcp(conn, {"ok": False, "error": "File already exists"})
                     else:
-                        data = {}
-                        self.write_file_locally(local_file, remote_file, data)
-                        if self.replicate_to_followers(remote_file, follower_node_ids):
-                            self.log(f"CREATE: {remote_file} replicated successfully")
-                            self.send_tcp(conn, {"ok": True})
+                        # NEW: choose path based on presence of 'file_size' (forwarded vs local)
+                        file_size = req.get("file_size")  # will be None for local case
+                        if file_size is not None:
+                            # forwarded case → receive stream
+                            dst_path = os.path.join(self.storage_dir, remote_file)
+                            self.receive_file_stream(conn, dst_path, int(file_size))
                         else:
-                            self.send_tcp(conn, {"ok": False, "error": "Replication failed"})
+                            # local case → just move (keep your existing behavior or use this helper)
+                            self.write_file_locally(local_file, remote_file)
+
+                        # (keep whatever you already do next: replication, OK reply, etc.)
                         self.log(f"CREATE: {remote_file} successful")
                         self.send_tcp(conn, {"ok": True})
 
@@ -1090,6 +1107,32 @@ class Daemon:
 
             except Exception as e:
                 self.log(f"Replication Manager error: {e}")
+
+    def forward_file_to_primary(self, command, remote_file, local_file, primary_node_id, client_conn):
+        try:
+            host, _ = primary_node_id.split(":")
+            file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), local_file)
+            file_size = os.path.getsize(file_path)
+
+            with socket.create_connection((host, self.file_system_port), timeout=5) as s:
+                self.send_tcp(s, {"command": command, "remote_file": remote_file, "file_size": file_size})
+                with open(file_path, "rb") as f:
+                    while True:
+                        buf = f.read(64 * 1024)
+                        if not buf:
+                            break
+                        s.sendall(buf)
+                resp = self.recv_msg_tcp(s)
+                self.send_tcp(client_conn, resp)
+
+            self.log(f"[FORWARD] {remote_file} ({file_size} bytes) -> {primary_node_id}")
+            return True
+        except Exception as e:
+            self.log(f"[FORWARD ERROR] {e}")
+            try: self.send_tcp(client_conn, {"ok": False, "error": str(e)})
+            except: pass
+            return False
+
 
 def main():
     parser = argparse.ArgumentParser(description="Membership daemon for MP2")
