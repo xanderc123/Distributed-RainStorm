@@ -996,6 +996,7 @@ class Daemon:
                     if self.file_exists_locally(remote_file):
                         self.send_tcp(conn, {"ok": False, "error": "[REPLICA] File already exists"})
                     else:
+                        data = {}
                         self.write_file_locally(local_file, remote_file, data)
                         self.log(f"[REPLICA] CREATE: {remote_file} successful")
                         self.send_tcp(conn, {"ok": True})
