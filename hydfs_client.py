@@ -160,8 +160,8 @@ def main():
                 return
             # Read local file content (sending text content for simplicity)
             content = args.localfilename.read_text("utf-8")
-            req["remote_file"] = args.HyDFSfilename
-            req["content"] = content
+            req["remote_file"] = str(args.HyDFSfilename)
+            req["local_file"] = str(args.localfilename)
         
         elif args.command in ["get", "merge", "ls", "getfromreplica"]:
             req["remote_file"] = args.HyDFSfilename

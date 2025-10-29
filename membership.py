@@ -12,6 +12,7 @@ from typing import Dict
 from suspicion import start_suspect, clear_suspect, delete_member
 import pathlib
 import os
+import shutil
 
 class Member:
     def __init__(self, id, heartbeat, last_heard, status, incarnation):
@@ -62,9 +63,9 @@ class Daemon:
         # mp3_file_system
         self.file_system_port = 9002
         # 2. Define the file storage path (e.g.: ./files_9000/)
-        self.file_storage_path = pathlib.Path(f"files_{self.port}")
+        self.file_storage_dir = pathlib.Path(f"DFS")
         # Create this directory (if it doesn't exist yet)
-        os.makedirs(self.file_storage_path, exist_ok=True)
+        os.makedirs(self.file_storage_dir, exist_ok=True)
         # 3. Set the replication factor (n=3)
         self.replication_factor = 3
         # 4. For rebalancing thread to detect membership changes
@@ -75,7 +76,7 @@ class Daemon:
 
     def log(self, message: str):
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        print(f"[{timestamp}] {message}")
+        print(f"[{timestamp}] {message}", flush=True)
 
     def broadcast_delete(self, target_id: str):
         msg = {
@@ -812,6 +813,20 @@ class Daemon:
         sorted_nodes.sort()
         return sorted_nodes
 
+    def get_file_lock(self, filename):
+        if filename not in self.file_locks:
+            self.file_locks[filename] = threading.Lock()
+        return self.file_locks[filename]
+
+    def file_exists_locally(self, filename):
+        return os.path.exists(os.path.join(self.file_storage_dir, filename))
+
+    def write_file_locally(self, filename, remote_file, data=None):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        src = os.path.join(base_dir, filename)
+        dst = os.path.join(self.file_storage_dir, remote_file)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy(src, dst)
 
     # Placeholder: You need to implement this consistent hashing routing function
     def find_replicas(self, filename: str) -> list:
@@ -853,6 +868,41 @@ class Daemon:
             
         return replicas
 
+    def replicate_to_followers(self, remote_file, follower_node_ids):
+        """
+        Sends the specified file to all follower replicas and waits for their acknowledgements.
+        Returns True if all followers acknowledged successfully, False otherwise.
+        """
+        success = True
+        file_path = os.path.join(self.file_storage_dir, remote_file)
+
+        try:
+            with open(file_path, "rb") as f:
+                file_data = f.read()
+        except Exception as e:
+            self.log(f"Replication error: cannot read local file {remote_file}: {e}")
+            return False
+
+        for node_id in follower_node_ids:
+            try:
+                host, _ = node_id.split(":")
+
+                with socket.create_connection((host, self.file_system_port), timeout=5) as s:
+                    self.send_tcp(s, {
+                        "command": "create_replica",
+                        "remote_file": remote_file,
+                        "file_data": file_data.decode("latin1")  # safe round-trip for binary
+                    })
+                    resp = self.recv_msg_tcp(s)
+                    if not resp.get("ok"):
+                        success = False
+                        self.log(f"[REPL] Replica {node_id} failed: {resp}")
+            except Exception as e:
+                success = False
+                self.log(f"[REPL] Could not contact replica {node_id}: {e}")
+
+        return success
+
     # New Thread 1 logic: Handle file clients (from server.py)
     def handle_file_client(self, conn, addr):
         try:
@@ -860,14 +910,10 @@ class Daemon:
             req = self.recv_msg_tcp(conn)
             command = req.get("command")
             remote_file = req.get("remote_file") # The HyDFS filename the client wants to operate on
-            print(f"Command: {command}")
-            print(f"Remote file: {remote_file}")
-
+            local_file = req.get("local_file") # The HyDFS filename the client wants to operate on
             # 2. Find replicas (consistent hashing)
             # This step is O(1) routing
             replicas = self.find_replicas(remote_file)
-            print(f"Replicas: {replicas}")
-            return
             if not replicas:
                 self.send_tcp(conn, {"ok": False, "error": "No nodes available"})
                 return
@@ -892,17 +938,17 @@ class Daemon:
             # --- To satisfy (ii) eventual consistency, primary replica must serialize operations on the same file ---
             # --- You need a file lock ---
             with self.get_file_lock(remote_file): # This is a lock function you need to implement
-                
                 if command == "create":
-                    # Check if file already exists
                     if self.file_exists_locally(remote_file):
                         self.send_tcp(conn, {"ok": False, "error": "File already exists"})
                     else:
-                        # 1. Receive file data from client
-                        # 2. Write file locally
-                        # 3. Forward "create" command and file data to all follower_node_ids
-                        # 4. Wait for all followers to acknowledge "OK"
-                        # 5. Send "OK" to original client
+                        data = {}
+                        self.write_file_locally(local_file, remote_file, data)
+                        if self.replicate_to_followers(remote_file, follower_node_ids):
+                            self.log(f"CREATE: {remote_file} replicated successfully")
+                            self.send_tcp(conn, {"ok": True})
+                        else:
+                            self.send_tcp(conn, {"ok": False, "error": "Replication failed"})
                         self.log(f"CREATE: {remote_file} successful")
                         self.send_tcp(conn, {"ok": True})
 
@@ -944,6 +990,14 @@ class Daemon:
                     # 4. Send "OK" to client
                     self.log(f"MERGE: {remote_file} successful")
                     self.send_tcp(conn, {"ok": True, "message": "Merge complete"})
+
+                if command == "create_replica":
+                    if self.file_exists_locally(remote_file):
+                        self.send_tcp(conn, {"ok": False, "error": "[REPLICA] File already exists"})
+                    else:
+                        self.write_file_locally(local_file, remote_file, data)
+                        self.log(f"[REPLICA] CREATE: {remote_file} successful")
+                        self.send_tcp(conn, {"ok": True})
                     
         except Exception as e:
             self.log(f"Handle file client error: {e}")
@@ -1000,7 +1054,7 @@ class Daemon:
 
                 # --- This is complex logic you need to implement ---
                 # 4. Iterate through all files stored locally on this node
-                local_files = list(self.file_storage_path.glob("*"))
+                local_files = list(self.file_storage_dir.glob("*"))
                 if not local_files:
                     self.log("No local files, rebalancing not needed.")
                 
