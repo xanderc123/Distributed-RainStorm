@@ -924,7 +924,7 @@ class Daemon:
             follower_node_ids = replicas[1:] # The rest are followers (n=3)
 
             # 4. Routing logic: Check if this node is the primary replica
-            if self.id != primary_node_id:
+            if self.id != primary_node_id and command != "create_replica":
                 # [Not primary replica]: Forward request to the real primary replica
                 # This is to satisfy (iii) read-your-writes consistency
                 self.log(f"Forwarding {command} for {remote_file} -> {primary_node_id}")
