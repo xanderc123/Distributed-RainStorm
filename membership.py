@@ -833,7 +833,7 @@ class Daemon:
         os.makedirs(os.path.dirname(dst_path), exist_ok=True)
         
         with open(dst_path, "wb") as f:
-            f.write(file_data)
+            f.write(data)
 
     # Placeholder: You need to implement this consistent hashing routing function
     def find_replicas(self, filename: str) -> list:
