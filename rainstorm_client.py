@@ -1,8 +1,12 @@
 # rainstorm_client.py
 import argparse
 import sys
+import socket
+import json
 
 VALID_OPS = {"transform", "filter", "aggregate"}
+LEADER_IP = "fa25-cs425-9801.cs.illinois.edu"
+LEADER_PORT = 9100
 
 def parse_operator(op_exe, op_args_list):
     if op_exe not in VALID_OPS:
@@ -35,6 +39,13 @@ def parse_operator(op_exe, op_args_list):
         return {"exe": op_exe, "args": (old, new)}
 
     raise RuntimeError("Unhandled operator case.")
+
+def send_job_to_leader(job):
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect((LEADER_IP, LEADER_PORT))
+    data = json.dumps(job).encode("utf-8")
+    s.sendall(data)
+    s.close()
 
 def main():
     parser = argparse.ArgumentParser(description="RainStorm client")
@@ -193,18 +204,34 @@ def main():
     # -----------------------------
     # Print parsed values
     # -----------------------------
-    print("Nstages =", Nstages)
-    print("Ntasks_per_stage =", Ntasks)
-    print("op1 =", op1)
+    job = {
+        "command": "SUBMIT_JOB",
+        "Nstages": Nstages,
+        "Ntasks_per_stage": Ntasks,
+        "operators": [],
+        "hydfs_src_directory": hydfs_src_directory,
+        "hydfs_dest_filename": hydfs_dest_filename,
+        "exactly_once": exactly_once,
+        "autoscale_enabled": autoscale_enabled,
+        "input_rate": input_rate,
+        "LW": LW,
+        "HW": HW,
+    }
+
+    job["operators"].append({
+        "exe": op1["exe"],
+        "args": op1["args"]
+    })
+
     if op2 is not None:
-        print("op2 =", op2)
-    print("hydfs_src_directory =", hydfs_src_directory)
-    print("hydfs_dest_filename =", hydfs_dest_filename)
-    print("exactly once =", exactly_once)
-    print("autoscale enabled =", autoscale_enabled)
-    print("input rate =", input_rate)
-    print("LW =", LW if LW else 0)
-    print("HW =", HW if HW else 0)
+        job["operators"].append({
+            "exe": op2["exe"],
+            "args": op2["args"]
+    })
+        
+    print("Final job object:")
+    print(job)
+    send_job_to_leader(job)
 
 if __name__ == "__main__":
     main()
