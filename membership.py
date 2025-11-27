@@ -14,6 +14,12 @@ import pathlib
 import os
 import shutil
 
+from hydfs_client import recv_msg
+
+def get_hash(name):
+        h = int(hashlib.sha1(name.encode('utf-8')).hexdigest(), 16)
+        return (h % 4096) + 1
+
 class Member:
     def __init__(self, id, heartbeat, last_heard, status, incarnation):
         self.id = id #node id
@@ -23,13 +29,15 @@ class Member:
         self.incarnation = incarnation 
         self.suspect_deadline = None 
         self.cleanup_timeout = None #for gossip
+        self.node_id = get_hash(self.id)
 
 class Daemon:
     def __init__(self, hostname, introducer, port, mode, drop,
                  t_fail, t_cleanup, t_suspect, heartbeat_interval):
         self.port = port
         self.hostname = hostname 
-        self.id = f"{hostname}:{port}"
+        self.startup_timestamp = int(time.monotonic())
+        self.id = f"{hostname}:{port}:{self.startup_timestamp}"
         self.mode = mode
         self.drop = drop
         self.suspicion_enabled = False 
@@ -62,8 +70,12 @@ class Daemon:
 
         # mp3_file_system
         self.file_system_port = 9002
+        # file_replica_verification_port
+        self.file_replica_verification_port = 9003
         # 2. Define the file storage path (e.g.: ./files_9000/)
         self.file_storage_dir = pathlib.Path(f"DFS")
+        # Clear storage directory (if restarting)
+        self.clean_storage_on_startup()
         # Create this directory (if it doesn't exist yet)
         os.makedirs(self.file_storage_dir, exist_ok=True)
         # 3. Set the replication factor (n=3)
@@ -76,7 +88,13 @@ class Daemon:
 
     def log(self, message: str):
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
-        print(f"[{timestamp}] {message}", flush=True)
+        log_message=f"[{timestamp}] {message}"
+        # write local log
+        with open("test.log", "a") as f:
+            f.write(log_message + "\n")
+        
+        if ("ERROR" in message or "SUSPECT" in message or "FAILED" in message):
+            print(log_message, flush=True)
 
     def broadcast_delete(self, target_id: str):
         msg = {
@@ -90,8 +108,8 @@ class Daemon:
             if m.id == self.id or m.status != "alive":
                 continue
             try:
-                ip, port_ts = m.id.split(":")
-                port = int(port_ts.split("-")[0])
+                ip, port = self.parse_id_for_sending(m.id)
+                if not ip: continue
                 self.sendJSON(msg, (ip, port))
             except Exception as e:
                 self.log(f"broadcast_delete: failed to {m.id}: {e}")
@@ -332,13 +350,11 @@ class Daemon:
             return
         if self.members[self.id].status == "left":
             return  
-        try:
-            ip, port_timestamp = member.id.split(":")
-            port = int(port_timestamp.split("-")[0])
-        except Exception as e:
-            print(f"Invalid member id format for {member.id}: {e}")
+        ip, port = self.parse_id_for_sending(member.id)
+        if not ip:
+            self.log(f"Invalid member id format for {member.id}")
             return
-        
+                
         message = {
             "type": "HEARTBEAT",
             "id": self.id,
@@ -371,8 +387,8 @@ class Daemon:
             if not peers:
                 continue
 
-            ip = peers[0].id.split(":")[0]
-            port = int(peers[0].id.split(":")[1].split("-")[0])
+            ip, port = self.parse_id_for_sending(peers[0].id)
+            if not ip: continue
             mid = peers[0].id
 
             nonce = random.randint(1, 2**31 - 1)
@@ -453,7 +469,7 @@ class Daemon:
             self.log(f"unknown message type: {msg_type}")
 
     def handle_join(self, message):
-        if self.id != self.introducer:
+        if not self.id.startswith(self.introducer):
             self.log(f"Ignored JOIN request because this node is not the introducer")
             return
         node_id = message.get("id")
@@ -492,8 +508,8 @@ class Daemon:
         data = json.dumps(welcome_message).encode("utf-8")
 
         try:
-            ip, port_timestamp = node_id.split(":")
-            port = int(port_timestamp.split("-")[0])
+            ip, port = self.parse_id_for_sending(node_id)
+            if not ip: return
             self.sendJSON(welcome_message, (ip, port))
             print(f'Sent welcome message to {node_id}')
         except Exception as e:
@@ -597,7 +613,6 @@ class Daemon:
                 
                 self.broadcast_delete(target)
             else:
-                self.log(f"Received DELETE for unknown member {target}")
                 self.broadcast_delete(target)
 
     def handle_leave(self, message):
@@ -630,8 +645,8 @@ class Daemon:
             for mem in self.members.values():
                 if mem.id != self.id and mem.status == "alive":
                     try:
-                        ip, port_timestamp = mem.id.split(":")
-                        port = int(port_timestamp.split("-")[0])
+                        ip, port = self.parse_id_for_sending(mem.id)
+                        if not ip: continue
                         self.sendJSON(leave_message, (ip, port))
                         self.log(f"Sent LEAVE message to {mem.id}")
                     except Exception as e:
@@ -694,6 +709,30 @@ class Daemon:
                         for m in self.members.values():
                             mem_list += f"Member {m.id}: status={m.status}, incarnation={m.incarnation}\n"
                     conn.sendall((mem_list + "\n").encode())
+                
+                elif cmd == "LIST_MEM_IDS":
+                    self.log("Control: processing LIST_MEM_IDS")
+                    members_info = []
+                    
+                    # 1. Iterate through the member list
+                    with self.lock:
+                        for m in self.members.values():
+                            # 2. Calculate the *consistent* "Ring ID" (hash value)
+                            #    (We use the exact same hashing as find_replicas)
+                            # 3. Store all required information
+                            members_info.append((m.id, m.node_id, m.status, m.incarnation))
+                    
+                    # 4. Sort as per specification requirements, by "nodeID" (i.e., the m.id string)
+                    members_info.sort(key=lambda x: x[0])
+                    
+                    # 5. Format the output, preserving original content and augmenting it
+                    response_lines = []
+                    response_lines.append("--- Membership List (Sorted by Node ID) ---")
+                    for node_id, node_hash, status, incarnation in members_info:
+                        # Preserves the original "status" and "incarnation"
+                        response_lines.append(f"Member {node_id}: status={status}, incarnation={incarnation}, RingID: {node_hash}")
+                    
+                    conn.sendall(("\n".join(response_lines) + "\n").encode())
 
                 elif cmd == "LIST_SELF":
                     conn.sendall((self.id + "\n").encode())
@@ -782,6 +821,86 @@ class Daemon:
         (length,) = struct.unpack("!I", hdr)
         data = self.recv_tcp(sock, length)
         return json.loads(data.decode("utf-8"))
+    
+    def parse_id_for_sending(self, node_id: str) -> tuple:
+     
+        try:
+           
+            # "hostname:port:12345" -> ("hostname:port", "12345")
+            host_port, _ = node_id.rsplit(":", 1)
+            
+            # "hostname:port" -> ("hostname", "port")
+            host, port_str = host_port.split(":")
+            
+            port_str_clean = port_str.split("-")[0]
+            
+            return host, int(port_str_clean)
+            
+        except Exception as e:
+            self.log(f"CRITICAL: unable to parse ID '{node_id}': {e}")
+            return None, None
+        
+    def write_block(self, remote_file: str, block_name: str, content_bytes: bytes):
+            """
+            [新] 将一个数据块写入到文件的子目录中。
+            例如：DFS/sdfs.txt/block-00001
+            """
+            # 1. 为文件创建一个目录 (例如 "DFS/sdfs.txt/")
+            file_dir = self.file_storage_dir / remote_file
+            os.makedirs(file_dir, exist_ok=True)
+            
+            # 2. 写入块文件
+            block_path = file_dir / block_name
+            block_path.write_bytes(content_bytes)
+            self.log(f"Wrote block: {block_path}")
+
+    def get_next_block_name(self, remote_file: str) -> str:
+
+        file_dir = self.file_storage_dir / remote_file
+        if not file_dir.is_dir():
+            return "block-00001"
+            
+
+        blocks = sorted([p.name for p in file_dir.glob("block-*") if p.is_file()])
+        
+        if not blocks:
+
+            return "block-00001"
+        
+
+        last_block = blocks[-1] # e.g., "block-00002"
+        last_num = int(last_block.split("-")[1])
+        next_num = last_num + 1
+        # 使用 5 位数字填充 (例如 00003)
+        return f"block-{next_num:05d}"
+
+    def read_all_blocks(self, remote_file: str) -> bytes:
+        """
+        [新] 读取一个文件的所有块，按顺序将它们连接起来。
+        """
+        file_dir = self.file_storage_dir / remote_file
+        if not file_dir.is_dir():
+            raise FileNotFoundError(f"No such file (directory): {remote_file}")
+            
+        # 1. 查找所有块并按字母顺序排序
+        block_paths = sorted([p for p in file_dir.glob("block-*") if p.is_file()])
+        
+        full_content = bytearray()
+        # 2. 按顺序连接
+        for block_path in block_paths:
+            full_content.extend(block_path.read_bytes())
+            
+        return full_content
+
+    def get_local_block_list(self, remote_file: str) -> list:
+        """
+        [新] 仅获取本地存储的块名称列表。
+        """
+        file_dir = self.file_storage_dir / remote_file
+        if not file_dir.is_dir():
+            return []
+        return sorted([p.name for p in file_dir.glob("block-*") if p.is_file()])
+       
     def get_file_lock(self, filename: str) -> threading.Lock:
         """
         Atomically acquire or create a file-specific lock
@@ -796,8 +915,8 @@ class Daemon:
         """
         Check if the file exists in the node's local storage path.
         """
-        local_path = self.file_storage_path / filename
-        return local_path.exists()
+        local_path = self.file_storage_dir / filename
+        return local_path.is_dir()
 
     def get_sorted_node_hash_list(self):
         sorted_nodes = []
@@ -807,32 +926,40 @@ class Daemon:
                 return []
 
             for m in alive_members:
-                node_hash = int(hashlib.sha1(m.id.encode('utf-8')).hexdigest(), 16)
+                node_hash = get_hash(m.id)
                 sorted_nodes.append((node_hash, m.id))
         
         sorted_nodes.sort()
         return sorted_nodes
 
-    def get_file_lock(self, filename):
-        if filename not in self.file_locks:
-            self.file_locks[filename] = threading.Lock()
-        return self.file_locks[filename]
 
-    def file_exists_locally(self, filename):
-        return os.path.exists(os.path.join(self.file_storage_dir, filename))
+    def get_hydfs_files_on_node(self) -> list:
+  
+            files_with_ids = []
 
-    def write_file_locally(self, filename, remote_file, data=None):
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        src = os.path.join(base_dir, filename)
-        dst = os.path.join(self.file_storage_dir, remote_file)
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        shutil.copy(src, dst)
+
+            for f in self.file_storage_dir.iterdir():
+           
+                if f.is_dir(): 
+                    filename = f.name 
+
+                    file_id_hash = get_hash(filename)
+                    files_with_ids.append({"filename": filename, "file_id": file_id_hash})
+
+            return files_with_ids
     
     def write_file_from_data(self, filename, data=None):
         dst_path = os.path.join(self.file_storage_dir, filename)
         os.makedirs(os.path.dirname(dst_path), exist_ok=True)
         
         with open(dst_path, "wb") as f:
+            f.write(data)
+    
+    def append_file_from_data(self, filename, data=None):
+        dst_path = os.path.join(self.file_storage_dir, filename)
+        os.makedirs(os.path.dirname(dst_path), exist_ok=True)
+        
+        with open(dst_path, "a") as f:
             f.write(data)
 
     # Placeholder: You need to implement this consistent hashing routing function
@@ -849,7 +976,7 @@ class Daemon:
         node_hashes = [h for h, nid in sorted_nodes]
         node_ids = [nid for h, nid in sorted_nodes]
 
-        file_hash = int(hashlib.sha1(filename.encode('utf-8')).hexdigest(), 16)
+        file_hash = get_hash(filename)
 
         # 5. Find the successor node
         # `bisect_right` finds the index of the first node with hash greater than file_hash
@@ -875,40 +1002,39 @@ class Daemon:
             
         return replicas
 
-    def replicate_to_followers(self, remote_file, follower_node_ids):
-        """
-        Sends the specified file to all follower replicas and waits for their acknowledgements.
-        Returns True if all followers acknowledged successfully, False otherwise.
-        """
-        success = True
-        file_path = os.path.join(self.file_storage_dir, remote_file)
+    def replicate_to_followers(self, remote_file, follower_node_ids, file_data_bytes, command,block_name: str = None):
+            """
+            Sends the file *content* to all follower replicas.
+            """
+            print(f"[REPLICATION] Starting replication for '{remote_file}' to {len(follower_node_ids)} followers")
+            success = True
+            for i,node_id in enumerate(follower_node_ids):
+                print(f"[REPLICATION] Sending to follower {i+1}: {node_id}")
+                try:
+                    host, port = self.parse_id_for_sending(node_id)
+                    if not host: continue
+                    file_port = port + 2
+                    print(f"[REPLICATION] Connecting to {host}:{file_port}")
 
-        try:
-            with open(file_path, "rb") as f:
-                file_data = f.read()
-        except Exception as e:
-            self.log(f"Replication error: cannot read local file {remote_file}: {e}")
-            return False
+                    with socket.create_connection((host, file_port), timeout=5) as s:
+                        # Send content directly instead of reading from disk
+                        replica_req = {
+                            "command": command,
+                            "remote_file": remote_file,
+                            "content": file_data_bytes.decode("utf-8") 
+                        }
+                        if block_name:
+                            replica_req["block_name"] = block_name # 添加块名称
 
-        for node_id in follower_node_ids:
-            try:
-                host, _ = node_id.split(":")
-
-                with socket.create_connection((host, self.file_system_port), timeout=5) as s:
-                    self.send_tcp(s, {
-                        "command": "create_replica",
-                        "remote_file": remote_file,
-                        "file_data": file_data.decode("latin1")  # safe round-trip for binary
-                    })
-                    resp = self.recv_msg_tcp(s)
-                    if not resp.get("ok"):
-                        success = False
-                        self.log(f"[REPL] Replica {node_id} failed: {resp}")
-            except Exception as e:
-                success = False
-                self.log(f"[REPL] Could not contact replica {node_id}: {e}")
-
-        return success
+                        self.send_tcp(s, replica_req)
+                        resp = self.recv_msg_tcp(s)
+                        if not resp.get("ok"):
+                            success = False
+                            self.log(f"[REPL] Replica {node_id} failed: {resp.get('error')}")
+                except Exception as e:
+                    success = False
+                    self.log(f"[REPL] Could not contact replica {node_id}: {e}")
+            return success
 
     def receive_file_stream(self, conn, dst_path, file_size):
         os.makedirs(os.path.dirname(dst_path), exist_ok=True)
@@ -922,30 +1048,97 @@ class Daemon:
                 remaining -= len(chunk)
         self.log(f"[RECV] Wrote {file_size - remaining} bytes to {dst_path}")
 
+    def clean_storage_on_startup(self):
+        """Clear file storage when node starts up"""
+        if os.path.exists(self.file_storage_dir):
+            self.log(f"Cleaning storage directory: {self.file_storage_dir}")
+            # Delete all files but preserve directory structure
+            for file_path in self.file_storage_dir.glob("*"):
+                if file_path.is_file():
+                    file_path.unlink()
+                elif file_path.is_dir():
+                    shutil.rmtree(file_path)
+            self.log("Storage directory cleaned")
+
+    def forward_append_to_replica(self, hostname, req):
+        file_server_port = 9002
+        response = []
+        with socket.create_connection((hostname, file_server_port), timeout=10) as s:
+            s.settimeout(10)
+            send(s, req)
+            resp = recv_msg(s)
+            if resp.get("ok"):
+                msg = f"Success: Append on secondary replica {hostname} is completed."
+            else:
+                msg = f"Error: Append failed on secondary replica {hostname}. Returned error: {resp.get('error', 'Unknown error')}"
+            self.log(msg)
+
+    # New Thread 1 logic: Handle file clients (from server.py)
+    def handle_file_client_verification(self, conn, addr):
+        try:
+            req = self.recv_msg_tcp(conn)
+            filename = req.get("filename")
+            print(f"[SERVER] Received {req.get('command')} command for file: {filename}")
+
+            dfs_dir = pathlib.Path(self.file_storage_dir)
+            file_path = dfs_dir / filename
+            if file_path.exists():
+                return self.send_tcp(conn, {"ok": True, "error": "File already exists"})
+            return self.send_tcp(conn, {"ok": False, "error": "File doesn't exist"})
+        except Exception as e:
+            self.log(f"Handle file verification client error: {e}")
+            try:
+                # Ensure client doesn't wait forever
+                self.send_tcp(conn, {"ok": False, "error": str(e)})
+            except:
+                pass # Connection might already be closed
+        finally:
+            conn.close()
+
     # New Thread 1 logic: Handle file clients (from server.py)
     def handle_file_client(self, conn, addr):
+        
         try:
             # 1. Receive client request (e.g.: {"command": "append", "remote_file": "file.txt", ...})
-            req = self.recv_msg_tcp(conn)
+            print(f"[SERVER] New connection from {addr}")
+            req = self.recv_msg_tcp(conn)       
             command = req.get("command")
             remote_file = req.get("remote_file") # The HyDFS filename the client wants to operate on
-            local_file = req.get("local_file") # The HyDFS filename the client wants to operate on
+            content = req.get("content") # The HyDFS filename the client wants to operate on
+            secondary_replica = int(req.get("secondary_replica", 0))
+            print(f"Received request from {addr}: {command} {remote_file}")
             # 2. Find replicas (consistent hashing)
+            print(f"Client: {addr}")
+            print(f"Command: {command}")
+            print(f"Remote file: {remote_file}")
+            print(f"This node: {self.id}")
             # This step is O(1) routing
             replicas = self.find_replicas(remote_file)
+            print(f"[ROUTING] File '{remote_file}' replicas: {replicas}")
+            print(f"[ROUTING] Primary replica: {replicas[0]}, This node: {self.id}")
             if not replicas:
+                print(f"[FORWARD] Forwarding to primary: {primary_node_id}")
                 self.send_tcp(conn, {"ok": False, "error": "No nodes available"})
                 return
+         
 
             # 3. Determine primary replica (Leader)
             # We agree: the first node on the hash ring (replicas[0]) is the primary replica for this file
             primary_node_id = replicas[0]
             follower_node_ids = replicas[1:] # The rest are followers (n=3)
+            print(f"[ROUTING] Primary replica: {primary_node_id}, This node: {self.id}")
 
 
-            # 4. Routing logic: Check if this node is the primary replica
-            if self.id != primary_node_id:
-                self.forward_file_to_primary(command, remote_file, local_file, primary_node_id, conn)
+            internal_commands = [
+                "append_replica", 
+                "create_replica",
+                "getfromreplica",            
+                "_internal_merge_check" # (你当前的 merge 逻辑)
+            ]
+            
+            if command not in internal_commands and self.id != primary_node_id:
+                # [非主副本]：转发请求
+                self.forward_file_to_primary(primary_node_id, req, conn)
                 return
 
             #     # This is to satisfy (iii) read-your-writes consistency
@@ -961,28 +1154,70 @@ class Daemon:
             # --- You need a file lock ---
             with self.get_file_lock(remote_file): # This is a lock function you need to implement
                 if command == "create":
-                    if self.file_exists_locally(remote_file):
+                    # 规范 ：只有第一次 create 应该成功
+                    if self.file_exists_locally(remote_file): # 现在检查目录
+                        print(f"CREATE: Completed with error: File already exists")
                         self.send_tcp(conn, {"ok": False, "error": "File already exists"})
                     else:
-                        # NEW: choose path based on presence of 'file_size' (forwarded vs local)
-                        file_size = req.get("file_size")  # will be None for local case
-                        if file_size is not None:
-                            # forwarded case → receive stream
-                            dst_path = os.path.join(self.file_storage_dir, remote_file)
-                            self.receive_file_stream(conn, dst_path, int(file_size))
-                        else:
-                            # local case → just move (keep your existing behavior or use this helper)
-                            self.write_file_locally(local_file, remote_file)
+                        content_str = req.get("content", "")
+                        content_bytes = content_str.encode("utf-8")
+                        
+                        # 1. 定义第一个块的名称
+                        block_name = "block-00001"
+                        
+                        # 2. 写入第一个块
+                        self.write_block(remote_file, block_name, content_bytes)
 
-                        # (keep whatever you already do next: replication, OK reply, etc.)
-                        self.log(f"CREATE: {remote_file} successful")
-                        self.send_tcp(conn, {"ok": True})
+                        # 3. 复制到跟随者 (我们必须告诉它们块的名称)
+                        success = self.replicate_to_followers(
+                            remote_file, 
+                            follower_node_ids, 
+                            content_bytes, 
+                            "create_replica", # 内部命令
+                            block_name        # 额外参数
+                        )
+                        
+                        if success:
+                            self.log(f"CREATE: {remote_file} successful and replicated.")
+                            print(f"CREATE: Completed request for '{remote_file}'") #
+                            self.send_tcp(conn, {"ok": True, "replicas": replicas})
+                        else:
+                            self.log(f"CREATE: {remote_file} created locally, but replication failed.")
+                            print(f"CREATE: Completed with error: Replication failed") #
+                            self.send_tcp(conn, {"ok": False, "error": "Failed to replicate file to all followers"})
 
                 elif command == "append":
-                    # Check if file exists
-                    if not self.file_exists_locally(remote_file):
+                   # 规范：Append 要求文件必须存在
+                    if not self.file_exists_locally(remote_file): # 检查目录
+                        print(f"APPEND: Completed with error: File does not exist")
                         self.send_tcp(conn, {"ok": False, "error": "File does not exist"})
                     else:
+                        content_str = req.get("content", "")
+                        content_bytes = content_str.encode("utf-8")
+                        
+                        # 1. 计算下一个块的名称
+                        block_name = self.get_next_block_name(remote_file)
+                        
+                        # 2. 写入这个新块
+                        self.write_block(remote_file, block_name, content_bytes)
+
+                        # 3. 复制这个新块
+                        # (我们重用 'append_replica' 命令，但它现在也需要 block_name)
+                        success = self.replicate_to_followers(
+                            remote_file, 
+                            follower_node_ids, 
+                            content_bytes, 
+                            "append_replica", # 内部命令
+                            block_name        # 额外参数
+                        )
+                        
+                        if success:
+                            self.log(f"APPEND: {remote_file} successful and replicated.")
+                            self.send_tcp(conn, {"ok": True, "replicas": replicas})
+                        else:
+                            self.log(f"APPEND: {remote_file} appended locally, but replication failed.")
+                            self.send_tcp(conn, {"ok": False, "error": "Failed to replicate file to all followers"})
+
                         # 1. Receive data to append from client
                         # 2. Append data to local file
                         # 3. Forward "append" command and appended data to all follower_node_ids
@@ -990,42 +1225,244 @@ class Daemon:
                         # 4. Wait for all followers to acknowledge "OK"
                         # 5. Send "OK" to original client
                         #    (This ensures (i) client append order)
-                        self.log(f"APPEND: {remote_file} successful")
+                
+                elif command == "append_replica":
+                    print(f"Received request from Primary: append_replica {remote_file}")
+                    
+                    if not self.file_exists_locally(remote_file): # 检查目录
+                        print(f"APPEND_REPLICA: Completed with error: File does not exist")
+                        self.send_tcp(conn, {"ok": False, "error": "[REPLICA] File doesn't exist."})
+                    else:
+                        content_str = req.get("content", "")
+                        content_bytes = content_str.encode("utf-8")
+                        
+                        # 1. 接收块名称 (如果主副本没有发送，就自己计算)
+                        block_name = req.get("block_name")
+                        if not block_name:
+                            block_name = self.get_next_block_name(remote_file)
+                            
+                        # 2. 写入这个新块
+                        self.write_block(remote_file, block_name, content_bytes)
+                        
+                        self.log(f"[REPLICA] Append: {remote_file}/{block_name} successful")
+                        print(f"APPEND_REPLICA: Completed request for '{remote_file}/{block_name}'")
                         self.send_tcp(conn, {"ok": True})
 
                 elif command == "get":
-                    #
-                    # (Because we are the primary replica, we guarantee having the latest data)
-                    if not self.file_exists_locally(remote_file):
+                    # The routing logic has already ensured we are the primary replica.
+                    # This satisfies (iii) Read-my-writes.
+                    
+                    self.log(f"GET: Processing get for '{remote_file}'")
+                        
+                    try:
+                        # 1. 读取并连接所有块
+                        content_bytes = self.read_all_blocks(remote_file)
+                        content = content_bytes.decode("utf-8") # 假设是 utf-8
+                            
+                        self.log(f"GET: {remote_file} successful. Sending {len(content)} bytes.")
+                        print(f"GET: Completed request for '{remote_file}'")
+                        self.send_tcp(conn, {"ok": True, "file_data": content})
+                        
+                    except FileNotFoundError:
+                        self.log(f"GET: Error - File not found: {remote_file}")
+                        print(f"GET: Completed with error: File not found")
                         self.send_tcp(conn, {"ok": False, "error": "File not found"})
-                    else:
-                        # 1. Read file data locally
-                        # 2. Send file data back to client
-                        self.log(f"GET: {remote_file} successful")
-                        self.send_tcp(conn, {"ok": True, "file_data": ...})
+                            
+                    except Exception as e:
+                            self.log(f"GET: Error reading file {remote_file}: {e}")
+                            print(f"GET: Completed with error: {e}") #
+                            self.send_tcp(conn, {"ok": False, "error": f"Error reading file: {e}"})
+
+                elif command == "getfromreplica":
+                        # 这个命令会绕过主副本路由
+                        self.log(f"GETFROMREPLICA: Processing request for '{remote_file}'")
+                        print(f"GETFROMREPLICA: Received request for '{remote_file}'") 
+
+                        try:
+                            # 1. [修改] 读取并连接所有块
+                            content_bytes = self.read_all_blocks(remote_file)
+                            content = content_bytes.decode("utf-8") # 假设是 utf-8
+
+                            self.log(f"GETFROMREPLICA: {remote_file} successful. Sending {len(content)} bytes.")
+                            print(f"GETFROMREPLICA: Completed request for '{remote_file}'") 
+                            self.send_tcp(conn, {"ok": True, "file_data": content})
+
+                        except FileNotFoundError:
+                            self.log(f"GETFROMREPLICA: Error - File not found: {remote_file}")
+                            print(f"GETFROMREPLICA: Completed with error: File not found") 
+                            self.send_tcp(conn, {"ok": False, "error": "File not found on this replica"})
+                        except Exception as e:
+                            self.log(f"GETFROMREPLICA: Error reading file {remote_file}: {e}")
+                            print(f"GETFROMREPLICA: Completed with error: {e}") 
+                            self.send_tcp(conn, {"ok": False, "error": f"Error reading file: {e}"})
+
+                elif command == "ls":
+                    self.log(f"LS: Processing ls for '{remote_file}'")
+                    try:
+                        found_replicas = []
+                        for replica in replicas:
+                            if self.id == replicas[0]:
+                                file_hash = get_hash(remote_file)
+                                if self.file_exists_locally(remote_file):
+                                    found_replicas.append((replica, get_hash(replica),))
+                                else:
+                                    self.send_tcp(conn, {"ok": False, "error": "File not found."})
+                                    return
+                            else:
+                                try:
+                                    host, port_str = replica.split(":")
+                                    self.log(f"[VERIFICATION] Connecting to {host}:{int(port_str) + 2}")
+
+                                    with socket.create_connection((host, int(port_str) + 2), timeout=5) as s:
+                                        # Send content directly instead of reading from disk
+                                        self.send_tcp(s, {
+                                            "command": "ls_replica",
+                                            "remote_file": remote_file,
+                                        })
+                                        resp = self.recv_msg_tcp(s)
+                                        if resp.get("ok"):
+                                            found_replicas.append((replica, get_hash(replica),))
+                                except Exception as e:
+                                    self.log(f"[REPL] Could not contact replica {replica}: {e}")
+
+                        self.log(f"Message: {found_replicas}")
+                        self.send_tcp(conn, {"ok": True, "file_id": file_hash, "replicas": found_replicas})
+                        # for replica in replicas:
+                        #     self.log(f"Replicas: {replicas}")
+                        # self.send_tcp(conn, {"ok": True, "file_id": file_hash, "replicas": replicas})
+                        # return
+                        # self.log(f"LS: FileID={file_hash}, Replicas={replicas}")
+                        # self.send_tcp(conn, {"ok": True, "file_id": file_hash, "replicas": replicas})
+                    
+                    except Exception as e:
+                        self.log(f"LS: Error processing ls: {e}")
+                        print(f"LS: Completed with error: {e}")
+                        self.send_tcp(conn, {"ok": False, "error": str(e)})       
+                
+                elif command == "ls_replica":
+                    self.log(f"LS: Processing ls_replica for '{remote_file}'")
+                    try:
+                        file_hash = get_hash(remote_file)
+                        if self.file_exists_locally(remote_file):
+                            self.send_tcp(conn, {"ok": True, "file_id": file_hash, "replicas": replicas})
+                        else:
+                            self.send_tcp(conn, {"ok": False, "error": "File not found."})
+                    except Exception as e:
+                        self.log(f"LS: Error processing ls: {e}")
+                        print(f"LS: Completed with error: {e}")
+                        self.send_tcp(conn, {"ok": False, "error": str(e)})       
 
                 elif command == "merge":
-                    #
-                    # Assumption: No new updates are occurring
-                    # Because primary replica always has the "correct" order (all writes must go through it)
-                    # So the merge logic is: primary replica forces its version to overwrite all followers
-                    
-                    # 1. Read *entire* file content locally
-                    # 2. Send *entire* content to all follower_node_ids (using an internal command like "FORCE_OVERWRITE")
-                    # 3. Wait for followers to acknowledge "OK"
-                    # 4. Send "OK" to client
-                    self.log(f"MERGE: {remote_file} successful")
-                    self.send_tcp(conn, {"ok": True, "message": "Merge complete"})
+                    # The routing logic already guarantees we are the primary replica.
+                    self.log(f"MERGE: Processing merge for '{remote_file}'")
+                    print(f"MERGE: Received request for '{remote_file}'") # Demo log
 
-                if command == "create_replica":
-                    if self.file_exists_locally(remote_file):
-                        self.send_tcp(conn, {"ok": False, "error": "[REPLICA] File already exists"})
+                    # Canonical assumption: no new updates during merge [cite: 55]
+                    if not self.file_exists_locally(remote_file):
+                        self.log(f"MERGE: Error - File not found: {remote_file}")
+                        print(f"MERGE: Completed with error: File not found") # Demo log
+                        self.send_tcp(conn, {"ok": False, "error": "File not found"})
                     else:
-                        file_data = req.get("file_data", "").encode("latin1")
-                        self.write_file_from_data(remote_file, file_data)
-                        self.log(f"[REPLICA] CREATE: {remote_file} successful")
-                        self.send_tcp(conn, {"ok": True})
+                        # 1. 获取主副本的块列表
+                        primary_blocks = self.get_local_block_list(remote_file)
+                        self.log(f"MERGE: Primary has blocks: {primary_blocks}")
+                        
+                        # 2. 遍历所有跟随者，命令它们检查
+                        all_success = True
+                        for node_id in follower_node_ids:
+                            try:
+                                host, port = self.parse_id_for_sending(node_id)
+                                if not host: continue
+                                
+                                with socket.create_connection((host, self.file_system_port), timeout=10) as s:
+                                    # 3. 发送主副本的块列表
+                                    self.send_tcp(s, {
+                                        "command": "_internal_merge_check",
+                                        "remote_file": remote_file,
+                                        "primary_blocks": primary_blocks
+                                    })
+                                    
+                                    # 4. 等待跟随者回复它 *缺少* 的块
+                                    resp = self.recv_msg_tcp(s)
+                                    if not resp.get("ok"):
+                                        all_success = False; continue
+                                    
+                                    missing_blocks = resp.get("missing_blocks", [])
+                                    if not missing_blocks:
+                                        self.log(f"MERGE: Follower {node_id} is already in sync.")
+                                        continue
+                                        
+                                    self.log(f"MERGE: Follower {node_id} is missing {missing_blocks}")
+                                    
+                                    # 5. *只*发送缺失的块
+                                    for block_name in missing_blocks:
+                                        block_path = (self.file_storage_dir / remote_file) / block_name
+                                        content_bytes = block_path.read_bytes()
+                                        
+                                        # 我们重用 create_replica 来发送块
+                                        self.replicate_to_followers(
+                                            remote_file, 
+                                            [node_id], # 只发送给这个 follower
+                                            content_bytes, 
+                                            "create_replica", 
+                                            block_name
+                                        )
+
+                            except Exception as e:
+                                self.log(f"MERGE: Error merging with {node_id}: {e}")
+                                print(f"MERGE: Error merging with {node_id}: {e}")
+                                all_success = False
+                            
+                        if all_success:
+                                self.log(f"MERGE: {remote_file} successful.")
+                                print(f"MERGE: Completed request for '{remote_file}'") # 演示日志
+                                self.send_tcp(conn, {"ok": True, "message": "Merge complete"})
+                        else:
+                                self.log(f"MERGE: Error - Failed to merge all replicas.")
+                                print(f"MERGE: Completed with error: Failed to merge all replicas") # 演示日志
+                                self.send_tcp(conn, {"ok": False, "error": "Failed to merge all replicas"})
+                           
+
+                elif command == "_internal_merge_check":
+                    # 这是来自主副本的 merge 检查
+                    remote_file = req.get("remote_file")
+                    primary_blocks = set(req.get("primary_blocks", []))
                     
+                    # 1. 检查本地块
+                    local_blocks = set(self.get_local_block_list(remote_file))
+                    
+                    # 2. 计算差异
+                    missing_blocks = list(primary_blocks - local_blocks)
+                    
+                    self.log(f"[MERGE_CHECK] Missing blocks: {missing_blocks}")
+                    print(f"[MERGE_CHECK] Missing blocks: {missing_blocks}")
+                    
+                    # 3. 回复主副本
+                    self.send_tcp(conn, {"ok": True, "missing_blocks": missing_blocks})
+
+                elif command == "create_replica":
+                    print(f"Received request from Primary: create_replica {remote_file}")
+                    
+                    content_str = req.get("content", "")
+                    # 接收块名称 (如果不存在，则默认为 'block-00001' 以兼容旧版)
+                    block_name = req.get("block_name", "block-00001") 
+                    
+                    if content_str:
+                        content_bytes = content_str.encode("utf-8")
+                        # 写入特定的块
+                        self.write_block(remote_file, block_name, content_bytes)
+                        
+                        print(f"Completed request: create_replica {remote_file}/{block_name}")
+                        self.send_tcp(conn, {"ok": True})
+                    else:
+                        print(f"[CREATE_REPLICA] Error: Empty content")
+                        self.send_tcp(conn, {"ok": False, "error": "[REPLICA] Empty content"})
+                            
+
+
+                elif command == "liststore":
+                    self.send_tcp(conn, {"ok": True, "node_id": get_hash(self.id), "files": self.get_hydfs_files_on_node()})
+
         except Exception as e:
             self.log(f"Handle file client error: {e}")
             try:
@@ -1045,6 +1482,7 @@ class Daemon:
             s.bind(("0.0.0.0", self.file_system_port))
             s.listen(128)
             self.log(f"[HyDFS Server] Listening for file requests on TCP port {self.file_system_port}...")
+            print(f"[HyDFS Server] Listening for file requests on TCP port {self.file_system_port}...")
             
             while True:
                 conn, addr = s.accept()
@@ -1055,84 +1493,144 @@ class Daemon:
                     daemon=True
                 )
                 t.start()
+    
+    def tcp_file_server_verification(self):
+        """
+        This is the target for new thread 3. It listens for file validations on TCP port (e.g., 9003).
+        """
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind(("0.0.0.0", self.file_replica_verification_port))
+            s.listen(128)
+            self.log(f"[HyDFS Server] Listening for file verifications on TCP port {self.file_replica_verification_port}...")
+            print(f"[HyDFS Server] Listening for file verifications on TCP port {self.file_replica_verification_port}...")
+            
+            while True:
+                conn, addr = s.accept()
+                # Start a *new* worker thread for each client connection
+                t = threading.Thread(
+                    target=self.handle_file_client_verification,
+                    args=(conn, addr),
+                    daemon=True
+                )
+                t.start()
 
     # New Thread 2 target: Rebalance/Replication Manager
     def replication_manager(self):
-        """
-        This is the target for new thread 2. It periodically checks for membership changes and triggers rebalancing.
-       
-        """
-        self.log("[Replication Manager] Replication manager started.")
-        while True:
-            # 1. Wake up periodically
-            time.sleep(10) # Check every 10 seconds
+               
+            self.log("[Replication Manager] Replication manager started.")
+            while True:
+                time.sleep(8)
 
-            current_members = set()
-            try:
-                # 2. Get current list of alive members
-                with self.lock:
-                    current_members = set(m.id for m in self.members.values() if m.status == 'alive')
-                
-                # 3. Check if different from last recorded state
-                if current_members == self.previous_members:
-                    continue # No membership change, skip
-
-                self.log(f"Membership change detected: {len(self.previous_members)} -> {len(current_members)}")
-
-                # --- This is complex logic you need to implement ---
-                # 4. Iterate through all files stored locally on this node
-                local_files = list(self.file_storage_dir.glob("*"))
-                if not local_files:
-                    self.log("No local files, rebalancing not needed.")
-                
-                for file_path in local_files:
-                    filename = file_path.name
-                    # 5. Calculate correct replica locations based on *new* list
-                    new_replicas = self.find_replicas(filename)
+                current_members = set()
+                try:
+                    with self.lock:
+                        current_members = set(m.id for m in self.members.values() if m.status == 'alive')
                     
-                    # 6. Check if this node needs to move data
-                    if self.id not in new_replicas:
-                        # This node is no longer a replica, should send file to new replicas and delete local file
-                        self.log(f"Rebalancing: {filename} no longer belongs to this node. (not implemented)")
-                        # ... (Implement logic to send file to new_replicas) ...
-                        # os.remove(file_path) # Delete after successful transfer
+                    if current_members == self.previous_members:
+                        continue # 没有变化
 
-                    elif self.id == new_replicas[0]: # Assuming this node is primary replica
-                        # This node is still primary replica, need to ensure other replicas have data (re-replication)
-                        self.log(f"Re-replication: Checking replicas {new_replicas} for {filename} (not implemented)")
-                        # ... (Implement logic to check and send file to new_replicas[1] and [2]) ...
+                    self.log(f"Membership change detected: {len(self.previous_members)} -> {len(current_members)}")
 
-                # 7. Update state for next check
-                self.previous_members = current_members
-                self.log("Rebalancing/re-replication check completed.")
+                    # 遍历本地*所有*文件（现在是目录）
+                    local_file_dirs = [d for d in self.file_storage_dir.iterdir() if d.is_dir()]
+                    
+                    if not local_file_dirs:
+                        self.log("No local files, rebalancing not needed.")
+                    
+                    for file_dir in local_file_dirs:
+                        filename = file_dir.name # e.g., "sdfs-test-2.txt"
+                        
+                        # 1. 计算*新*的副本位置
+                        new_replicas = self.find_replicas(filename)
+                        
+                        # 2. 检查再平衡（Re-balancing）
+                        if self.id not in new_replicas:
+                            self.log(f"Rebalancing: {filename} no longer belongs to this node.")
+                            # shutil.rmtree(file_dir)
+                            continue
 
-            except Exception as e:
-                self.log(f"Replication Manager error: {e}")
+                        # 3. 检查再复制（Re-replication）
+                        # (只在主副本上执行)
+                        if self.id == new_replicas[0]:
+                            self.log(f"Re-replication check for: {filename}")
+                
+                            # 1. 获取主副本（我们）的块列表
+                            primary_blocks = self.get_local_block_list(filename)
+                            
+                            # 2. 检查*所有*跟随者
+                            for node_id in new_replicas[1:]:
+                                if node_id == self.id: continue # 以防万一
+                                
+                                try:
+                                    # 3. 检查跟随者缺少哪些块
+                                    host, port = self.parse_id_for_sending(node_id)
+                                    if not host: continue
+                                    
+                                    with socket.create_connection((host, self.file_system_port), timeout=5) as s:
+                                        self.send_tcp(s, {
+                                            "command": "_internal_merge_check",
+                                            "remote_file": filename,
+                                            "primary_blocks": primary_blocks
+                                        })
+                                        resp = self.recv_msg_tcp(s)
+                                        if not resp.get("ok"): continue
 
-    def forward_file_to_primary(self, command, remote_file, local_file, primary_node_id, client_conn):
+                                        missing_blocks = resp.get("missing_blocks", [])
+                                        if missing_blocks:
+                                            self.log(f"[REPL-MGR] Node {node_id} is missing {missing_blocks}")
+                                            # 5. *只*发送缺失的块
+                                            for block_name in missing_blocks:
+                                                block_path = file_dir / block_name
+                                                content_bytes = block_path.read_bytes()
+                                                self.replicate_to_followers(
+                                                    filename, 
+                                                    [node_id], 
+                                                    content_bytes, 
+                                                    "create_replica", 
+                                                    block_name
+                                                )
+                                except Exception as e:
+                                    self.log(f"[REPL-MGR] Could not re-replicate to {node_id}: {e}")
+                        
+                    # 7. 更新状态以备下次检查
+                    self.previous_members = current_members
+                    self.log("Rebalancing/re-replication check completed.")
+
+                except Exception as e:
+                    self.log(f"Replication Manager error: {e}")
+
+    def forward_file_to_primary(self, primary_node_id: str, req: dict, client_conn):
+    
         try:
-            host, _ = primary_node_id.split(":")
-            file_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), local_file)
-            file_size = os.path.getsize(file_path)
+            # 1. Extract the host and file port of the primary replica
+            host, port = self.parse_id_for_sending(primary_node_id)
+            if not host:
+                raise Exception(f"Could not parse primary_node_id: {primary_node_id}")
+            file_port = port + 2
 
-            with socket.create_connection((host, self.file_system_port), timeout=5) as s:
-                self.send_tcp(s, {"command": command, "remote_file": remote_file, "file_size": file_size})
-                with open(file_path, "rb") as f:
-                    while True:
-                        buf = f.read(64 * 1024)
-                        if not buf:
-                            break
-                        s.sendall(buf)
+            self.log(f"[FORWARD] Forwarding {req.get('command')} to primary replica {host}:{file_port}")
+
+            # 2. Establish a new connection to the primary replica
+            with socket.create_connection((host, file_port), timeout=10) as s:
+                s.settimeout(10)
+                
+                # 3. Forward the client's *original req* (now containing 'content') to the primary
+                self.send_tcp(s, req)
+                
+                # 4. Wait for the primary replica's *final* response (e.g., {"ok": True, "replicas": [...]})
                 resp = self.recv_msg_tcp(s)
+                
+                # 5. Relay the primary replica's response unchanged back to the *original client*
                 self.send_tcp(client_conn, resp)
 
-            self.log(f"[FORWARD] {remote_file} ({file_size} bytes) -> {primary_node_id}")
-            return True
         except Exception as e:
-            self.log(f"[FORWARD ERROR] {e}")
-            try: self.send_tcp(client_conn, {"ok": False, "error": str(e)})
-            except: pass
-            return False
+            self.log(f"[FORWARD ERROR] Failed to forward to {primary_node_id}: {e}")
+            try:
+                # Ensure the original client doesn't get stuck
+                self.send_tcp(client_conn, {"ok": False, "error": f"Failed to forward request to primary: {e}"})
+            except Exception:
+                pass  # Original client connection may have been closed
 
 
 def main():
@@ -1160,7 +1658,7 @@ def main():
         heartbeat_interval=1
     )
 
-    if daemon.id != daemon.introducer:
+    if not daemon.id.startswith(daemon.introducer):
         daemon.send_join()
 
     threading.Thread(target=daemon.receiver, daemon=True).start()
@@ -1171,6 +1669,7 @@ def main():
     threading.Thread(target=daemon.control_server, daemon=True).start()
     threading.Thread(target=daemon.replication_manager, daemon=True).start()
     threading.Thread(target=daemon.tcp_file_server, daemon=True).start()
+    threading.Thread(target=daemon.tcp_file_server_verification, daemon=True).start()
 
     # time.sleep(60)
     try:

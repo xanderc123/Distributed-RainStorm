@@ -1,4 +1,5 @@
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 import json
 import socket
 import struct
@@ -60,6 +61,62 @@ def read_hosts_file(path: pathlib.Path) -> List[Tuple[str, int]]:
         
     return hosts
 
+def cmd_multiappend(hydfsfilename, target_host_files):
+    print(f"[DEBUG] multiappend starting with {len(list(target_host_files))} tasks", flush=True)
+    print(f"[DEBUG] target_host_files = {list(target_host_files)}", flush=True)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {
+            pool.submit(handle_vm_append_client, host, hydfsfilename, lfile): (host, lfile)
+            for host, lfile in target_host_files
+        }
+        for fut in as_completed(futures):
+            host, lfile = futures[fut]
+            try:
+                h, ok, err = fut.result()
+                if ok:
+                    print(f"  ✓ {host} appended {lfile} → {hydfsfilename}")
+                else:
+                    print(f"  ✗ {host} failed {lfile}: {err}", file=sys.stderr)
+            except Exception as e:
+                print("FERROR")
+
+def handle_vm_append_client(host, hydfsfilename, localfilename, timeout=10):
+    """One append RPC to a single VM; returns (host, ok, error, finished_at)."""
+    content = pathlib.Path(localfilename).read_text('utf-8')
+    try:
+        req = {
+            "command": "append",
+            "remote_file": hydfsfilename,
+            "local_file": localfilename,
+            "content": content
+        }
+
+        with socket.create_connection((host, FILE_SERVER_PORT), timeout=timeout) as s:
+            s.settimeout(timeout)
+            send(s, req)
+            resp = recv_msg(s)
+        ok = bool(resp.get("ok"))
+        err = None if ok else resp.get("error", "unknown")
+        return host, ok, err
+    except Exception as e:
+        print(f"[ERROR] {host} failed: {e}", flush=True)
+        return host, False, str(e)
+
+def resolve_vms(vm_list, hosts_path="hosts.txt"):
+    """Map ['VM1','VM2',...] to their real addresses from hosts.txt."""
+    with open(hosts_path) as f:
+        hosts = [line.strip() for line in f if line.strip()]
+
+    resolved = []
+    for vm in vm_list:
+        if not vm.upper().startswith("VM"):
+            raise ValueError(f"Invalid VM label: {vm}")
+        index = int(vm[2:]) - 1
+        if index >= len(hosts):
+            raise ValueError(f"{vm} not found: only {len(hosts)} entries in hosts.txt")
+        resolved.append(hosts[index].split(":")[0])
+    return resolved
+
 def get_connection_info(
     command: str, 
     hosts_list: List[Tuple[str, int]], 
@@ -68,7 +125,7 @@ def get_connection_info(
     """
     Determine which (host, port) to connect to based on command.
     """
-    if command == "liststore":
+    if command == "liststore" or command == "ls":
         # liststore runs on "this" VM
         # We assume file port is port in hosts.txt + 2
         file_port = 9002  # Default
@@ -86,7 +143,7 @@ def get_connection_info(
             print(f"Error: Invalid VM address format '{vm_address}'. Must be 'host:port' (e.g., 'fa25-cs425-a801.cs.illinois.edu:9000')", file=sys.stderr)
             sys.exit(1)
 
-    elif command == "create":
+    elif command == "create" or command == "append" or command == "get":
         return ("127.0.0.1", FILE_SERVER_PORT)
         
     else:
@@ -162,15 +219,20 @@ def main():
             content = args.localfilename.read_text("utf-8")
             req["remote_file"] = str(args.HyDFSfilename)
             req["local_file"] = str(args.localfilename)
+            req["content"] = content
+            print(f"[CLIENT] Sending CREATE request to {target_host}:{target_port}")
+            print(f"[CLIENT] Local file: {args.localfilename}, Remote file: {args.HyDFSfilename}")
+            print(f"[CLIENT] Content length: {len(content)} bytes")
         
         elif args.command in ["get", "merge", "ls", "getfromreplica"]:
             req["remote_file"] = args.HyDFSfilename
             # 'getfromreplica' is treated as 'get' on server side
-            if args.command == "getfromreplica":
-                req["command"] = "get"
+        elif args.command == "getfromreplica":
+            req["command"] = "getfromreplica" # 
+            req["remote_file"] = args.HyDFSfilename
         
         elif args.command == "liststore":
-            pass  # Request is ready
+            req["remote_file"] = ""
 
     except Exception as e:
         print(f"Error preparing request: {e}", file=sys.stderr)
@@ -178,6 +240,7 @@ def main():
 
     # 5. Establish TCP connection and send request
     print(f"[{args.command}] Connecting to {target_host}:{target_port}...", file=sys.stderr)
+
     try:
         with socket.create_connection((target_host, target_port), timeout=10) as s:
             s.settimeout(10)
@@ -209,8 +272,13 @@ def main():
                 # For liststore, print files
                 if args.command == "liststore":
                     print(f"  > Node ID: {resp.get('node_id')}")
-                    print(f"  > Stored files: {resp.get('files')}")
-
+                    files = resp.get("files", [])
+                    if not files:
+                        print("  > Stored files: []")
+                    else:
+                        print("  > Stored files:")
+                        for f in files:
+                            print(f"    - {f}")
             else:
                 print(f"Error: Server returned error: {resp.get('error', 'Unknown error')}", file=sys.stderr)
 
