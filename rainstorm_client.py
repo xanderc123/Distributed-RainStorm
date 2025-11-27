@@ -40,14 +40,40 @@ def parse_operator(op_exe, op_args_list):
 
     raise RuntimeError("Unhandled operator case.")
 
-def send_job_to_leader(job):
+def print_task_table(tasks):
+    if not tasks:
+        print("No tasks.")
+        return
+
+    # Header
+    print(f"\n{'TASK_ID':<36} {'STAGE':<5} {'VM':<40} {'PORT':<6} {'OPERATOR':<10} {'ARGS'}")
+    print("-" * 110)
+
+    for t in tasks:
+        op = t["operator"]["exe"]
+        args = t["operator"]["args"]
+        print(f"{str(t['task_id'])[:36]:<36} {t['stage']:<5} {t['vm']:<40} {t['port']:<6} {op:<10} {args}")
+    print("-" * 110 + '\n')
+
+def send_msg(msg):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect((LEADER_IP, LEADER_PORT))
-    data = json.dumps(job).encode("utf-8")
+    data = json.dumps(msg).encode("utf-8")
     s.sendall(data)
+    reply = s.recv(65535).decode()
+
+    if msg["command"] == "LIST_TASKS":    
+        print_task_table(json.loads(reply))
     s.close()
 
 def main():
+    if len(sys.argv) <= 1:
+        sys.exit(0)
+
+    if sys.argv[1] == "list_tasks":
+        send_msg({"command": "LIST_TASKS"})
+        sys.exit(0)
+
     parser = argparse.ArgumentParser(description="RainStorm client")
 
     parser.add_argument("Nstages", type=int, choices=[1, 2])
@@ -231,7 +257,7 @@ def main():
         
     print("Final job object:")
     print(job)
-    send_job_to_leader(job)
+    send_msg(job)
 
 if __name__ == "__main__":
     main()
