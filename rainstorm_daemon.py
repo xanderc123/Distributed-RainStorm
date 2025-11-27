@@ -4,6 +4,7 @@ import socket
 import json
 import time
 import threading
+from uuid import uuid4
 
 class RainstormLeader:
     def __init__(self, logfile, host="0.0.0.0", port=9100):
@@ -13,6 +14,9 @@ class RainstormLeader:
         self.logfile = logfile
         self.init_log()
         self.members = set()
+        self.tasks =[]
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(("0.0.0.0", self.port))
 
     def init_log(self):
         open(self.logfile, "w").close()
@@ -20,13 +24,19 @@ class RainstormLeader:
     def run(self):
         threading.Thread(target=self.membership_check_loop, daemon=True).start()
         self.log(f"[Leader] Listening for job submissions on {self.host}:{self.port}")
-        self.listen_for_jobs()
+        self.listen()
 
     def log(self, message: str):
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
         with open(self.logfile, "a") as f:
             f.write(message + "\n")
         print(f"[{timestamp}] {message}", flush=True)
+
+    def sendJSON(self, obj: dict, addr_tuple) -> int:
+        data = json.dumps(obj, separators=(",", ":")).encode("utf-8")
+        sent = self.sock.sendto(data, addr_tuple)
+        # self.bytes_out += sent
+        return sent
 
     def retrieve_alive_members(self):
         try:
@@ -61,8 +71,11 @@ class RainstormLeader:
         self.log(f"Old: {old_members}")
         self.log(f"New: {new_members}")
         # TODO: Handling task rearrangement in case of membership change
+    
+    def list_tasks(self):
+        return self.tasks
 
-    def listen_for_jobs(self):
+    def listen(self):
         srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((self.host, self.port))
@@ -70,14 +83,94 @@ class RainstormLeader:
 
         while True:
             conn, addr = srv.accept()
-            data = conn.recv(65535)     # one job fits in one recv
-            conn.close()
+            data = conn.recv(65535).decode("utf-8")
 
             try:
-                job = json.loads(data.decode())
-                self.log(f"[Leader] Received job: {job}")
+                msg = json.loads(data)
+                
+                if msg["command"] == "LIST_TASKS":
+                    response = json.dumps(self.list_tasks())
+                    conn.sendall(response.encode())
+                elif msg["command"] == "KILL_TASKS":
+                    pass
+                elif msg["command"] == "SUBMIT_JOB":
+                    self.log(f"[Leader] Received job: {msg}")
+                    self.handle_job_submission(msg)
+                    conn.sendall("".encode())
+                else:
+                    conn.sendall(b"ERROR: Unknown command")
+                    conn.close()
             except Exception as e:
-                print("[Leader] Invalid job received:", e)
+                print("[Leader] Invalid command received:", e)
+            finally:
+                conn.close()
+
+    def handle_job_submission(self, job):
+        self.log("[Leader] Handling job submission")
+        self.log(str(job))
+
+        Nstages = job["Nstages"]
+        Ntasks = job["Ntasks_per_stage"]
+        operators = job["operators"]
+
+        workers = list(self.members)
+
+        if not workers:
+            self.log("[Leader] ERROR: No workers available!")
+            return
+
+        # Step 2: generate tasks
+        task_assignments = []  # list of (task_id, vm_ip, port, operator_info)
+
+        # PORT: IS IT UDP OR TCP
+        next_port = 10000
+
+        for stage in range(Nstages):
+            op = operators[stage]
+
+            for i in range(Ntasks):
+                task_id = uuid4().int
+                vm_ip = workers[(task_id) % len(workers)]
+
+                task_info = {
+                    "task_id": task_id,
+                    "stage": stage + 1,
+                    "vm": vm_ip,
+                    "port": next_port,
+                    "operator": op
+                }
+
+                task_assignments.append(task_info)
+
+        # Step 3: save routing table
+        self.tasks = task_assignments
+        self.log(f"[Leader] Routing table: {self.tasks}")
+
+        # Step 4: send START_TASK to each worker
+        for t in task_assignments:
+            self.send_start_task(t)
+
+    def send_start_task(self, task):
+        msg = {
+            "command": "START_TASK",
+            "task_id": task["task_id"],
+            "stage": task["stage"],
+            "port": task["port"],
+            "operator": task["operator"]
+        }
+
+        vm = task["vm"]
+
+        try:
+            # s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # s.connect((vm, 9200))  # worker's control port
+            # s.sendall(json.dumps(msg).encode())
+            # s.close()
+
+            self.log(f"[Leader] Sent START_TASK to {vm}: {msg}")
+
+        except Exception as e:
+            self.log(f"[Leader] Failed to contact worker {vm}: {e}")
 
 def main():
     parser = argparse.ArgumentParser()
