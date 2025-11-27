@@ -172,6 +172,74 @@ class RainstormLeader:
         except Exception as e:
             self.log(f"[Leader] Failed to contact worker {vm}: {e}")
 
+class RainstormWorker:
+
+    def __init__(self, logfile, host="0.0.0.0", port=9200):
+        self.host = host
+        self.port = port
+        self.logfile = logfile
+        self.init_log()
+        self.running_tasks = {}  # Store currently running task information
+        
+    def init_log(self):
+        # Create file if it doesn't exist
+        with open(self.logfile, "a") as f:
+            pass
+
+    def log(self, message: str):
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
+        log_msg = f"[{timestamp}] {message}"
+        with open(self.logfile, "a") as f:
+            f.write(log_msg + "\n")
+        print(log_msg, flush=True)
+
+    def run(self):
+        self.log(f"[Worker] Started. Listening on {self.host}:{self.port}")
+        self.listen()
+
+    def listen(self):
+        # Start TCP Server to listen for Leader's commands
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server.bind((self.host, self.port))
+        server.listen(5)
+
+        while True:
+            conn, addr = server.accept()
+            # Start a thread for each connection to avoid blocking
+            t = threading.Thread(target=self.handle_message, args=(conn, addr), daemon=True)
+            t.start()
+
+    def handle_message(self, conn, addr):
+        try:
+            data = conn.recv(65535).decode("utf-8")
+            if not data:
+                return
+            
+            msg = json.loads(data)
+            command = msg.get("command")
+
+            if command == "START_TASK":
+                self.handle_start_task(msg)
+                # Reply to Leader acknowledging receipt of command
+                conn.sendall(json.dumps({"status": "OK"}).encode())
+            else:
+                self.log(f"[Worker] Unknown command received: {command}")
+
+        except Exception as e:
+            self.log(f"[Worker] Error handling message from {addr}: {e}")
+        finally:
+            conn.close()
+
+    def handle_start_task(self, task_info):
+        # Phase 1: Only print received task information to prove communication is successful
+        task_id = task_info.get("task_id")
+        operator = task_info.get("operator")
+        self.log(f"[Worker] Received start task command! ID: {task_id}, Operator: {operator}")
+        
+        # Temporarily only log, don't actually start the process
+        self.running_tasks[task_id] = task_info
+        
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=["leader", "worker"], required=True)
