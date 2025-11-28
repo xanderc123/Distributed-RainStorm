@@ -1,11 +1,14 @@
 # rainstorm_daemon.py
 import argparse
 import socket
+import csv
 import json
 import time
 import threading
 import re
 from uuid import uuid4
+
+from tasks import SourceThread, TaskThread
 
 class RainstormLeader:
     def __init__(self, logfile, host="0.0.0.0", port=9100):
@@ -115,7 +118,6 @@ class RainstormLeader:
                 elif msg["command"] == "KILL_TASKS":
                     pass
                 elif msg["command"] == "SUBMIT_JOB":
-                    self.log(f"[Leader] Received job: {msg}")
                     self.handle_job_submission(msg)
                     conn.sendall("".encode())
                 else:
@@ -164,7 +166,7 @@ class RainstormLeader:
                     "vm": vm_ip,
                     "port": self.allocate_port_for_vm(vm_ip),
                     "operator": op,
-                    "column": self.add_aggregate_column(operators[stage + 1]) if stage == 0 else ""
+                    "ag_column": self.add_aggregate_column(operators[stage + 1]) if stage == 0 else ""
                 }
 
                 task_assignments.append(task_info)
@@ -193,7 +195,7 @@ class RainstormLeader:
             "stage": task["stage"],
             "port": task["port"],
             "operator": task["operator"],
-            "column": task["column"]
+            "ag_column": task["ag_column"]
         }
 
         vm = task["vm"]
@@ -211,7 +213,7 @@ class RainstormLeader:
             s.sendall(json.dumps(msg).encode())
             s.close()
 
-            self.log(f"[Leader] Sent START_TASK to {vm}: {msg}")
+            # self.log(f"[Leader] Sent START_TASK to {vm}: {msg}")
 
         except Exception as e:
             self.log(f"[Leader] Failed to contact worker {vm}: {e}")
@@ -278,10 +280,13 @@ class RainstormWorker:
         operator = task_info.get("operator")
         port = task_info.get("port")
         next_stage_tasks = task_info.get("next_stage_tasks")
+        ag_column = task_info.get("ag_column")
 
         # self.log(f"[Worker] START_TASK received → id={task_id}, operator={operator}, port={port}")
-        self.log(f"Next stage tasks: {str(next_stage_tasks)}")
-        t = TaskThread(task_id, operator, port, self.logfile, next_stage_tasks)
+        # self.log(f"Next stage tasks: {str(next_stage_tasks)}")
+        # self.log("operator")
+        # self.log(task_info)
+        t = TaskThread(task_id, operator, port, self.logfile, next_stage_tasks, ag_column)
         t.start()
 
         self.running_tasks[task_id] = {
@@ -290,157 +295,6 @@ class RainstormWorker:
             "status": "running"
         }
 
-
-class SourceThread(threading.Thread):
-    def __init__(self, filepath, stage0_tasks, input_rate, logfile):
-        super().__init__(daemon=True)
-        self.filepath = filepath
-        self.tasks = stage0_tasks
-        self.input_rate = input_rate
-        self.logfile = logfile
-        self.running = True
-
-    def log(self, msg):
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        line = f"[{timestamp}] [SOURCE] {msg}"
-        with open(self.logfile, "a") as f:
-            f.write(line + "\n")
-        print(line, flush=True)
-
-    def run(self):
-        self.log("SourceThread started")
-
-        try:
-            with open(self.filepath, "r") as f:
-                lines = f.readlines()
-        except Exception as e:
-            self.log(f"Cannot read source file: {e}")
-            return
-
-        if not self.tasks:
-            self.log("ERROR: No stage-0 tasks available")
-            return
-
-        interval = 1 / self.input_rate
-        idx = 0
-
-        for idx, line in enumerate(lines[1:], 1):
-            if not self.running:
-                break
-
-            data_tuple = (f"{self.filepath}:{idx},{line.strip()}")
-            task = self.tasks[idx % len(self.tasks)]
-            idx += 1
-
-            vm = task["vm"]
-            port = task["port"]
-
-            try:
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.connect((vm, port))
-                s.sendall(data_tuple.encode())
-                s.close()
-            except Exception as e:
-                self.log(f"Failed to send to {vm}:{port} – {e}")
-
-            time.sleep(interval)
-
-        self.log("SourceThread finished")
-
-
-class TaskThread(threading.Thread):
-    def __init__(self, task_id, operator, port, logfile, next_stage_tasks=None):
-        super().__init__(daemon=True)
-        self.task_id = task_id
-        self.operator = operator
-        self.port = port
-        self.logfile = logfile
-        self.running = True
-        self.next_stage_tasks = next_stage_tasks
-
-    def log(self, msg):
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        # line = f"[{timestamp}] [Task {self.task_id}] {msg}"
-        line = msg
-        with open(self.logfile, "a") as f:
-            f.write(line + "\n")
-        print(line, flush=True)
-
-    def filter_pass(self, line):
-        # self.log(str(self.operator))
-        # return False
-        pattern = self.operator["args"]
-        return re.search(pattern, line) is not None
-
-    def extract_key(self, line, col_idx):
-        parts = line.split(',')
-
-        if col_idx < len(parts):
-            key = parts[col_idx].strip()
-            return key
-        else:
-            return ""
-
-    def select_next_stage_task(self, key):
-        self.log(str(self.next_stage_tasks))
-        if not self.next_stage_tasks:
-            return None
-
-        idx = hash(key) % len(self.next_stage_tasks)
-        return self.next_stage_tasks[idx]
-
-    def forward_tuple(self, line, dest):
-
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.connect((dest["vm"], dest["port"]))
-            s.sendall(line.encode())
-            s.close()
-        except Exception as e:
-            self.log(f"Routing error to {dest}: {e}")
-
-    def run(self):
-        self.log(f"Task thread started on data port {self.port}")
-
-        # ---- minimal data listener for incoming tuples ----
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind(("0.0.0.0", self.port))
-        server.listen(5)
-
-        # simple infinite accept loop
-        while self.running:
-            try:
-                conn, addr = server.accept()
-                data = conn.recv(65535).decode("utf-8").strip()
-                conn.close()
-
-                if data:
-                    key = data.strip().split(",")[0]
-                    line = ",".join(data.strip().split(",")[1:])
-                    if not self.filter_pass(line):
-                        continue  # drop line
-                    # self.log(line)
-                    # 2. EXTRACT KEY (aggregate column index provided in operator args?)
-                    col_idx = self.operator.get("column", None)
-                    if col_idx is None:
-                        # If pattern-only operator, no aggregation, default to column 0 for demo
-                        col_idx = 0
-                    next_key = self.extract_key(line, col_idx)
-                    # 3. SELECT DOWNSTREAM TASK
-                    dest = self.select_next_stage_task(next_key)
-                    if dest is None:
-                        self.log("No downstream tasks; cannot route.")
-                        continue
-                    # 4. FORWARD TO STAGE-2 TASK
-                    self.log(next_key)
-                    # self.forward_tuple(line, dest)
-                    # self.log(f"Forwarded tuple with key={next_key} to {dest['vm']}:{dest['port']}")
-
-
-            except Exception as e:
-                self.log(f"Error on task data port: {e}")
-                time.sleep(0.2)
         
 def main():
     parser = argparse.ArgumentParser()
