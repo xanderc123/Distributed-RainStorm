@@ -267,7 +267,7 @@ def main():
         
     print("Final job object:")
     print(job)
-    # send_msg(job)
+    send_msg(job)
 
 if __name__ == "__main__":
     main()
