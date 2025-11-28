@@ -14,10 +14,17 @@ def parse_operator(op_exe, op_args_list):
         sys.exit(1)
 
     if op_exe == "aggregate":
-        if len(op_args_list) != 0:
-            print("Error: 'aggregate' takes no arguments.")
+        if len(op_args_list) != 1:
+            print("Error: 'aggregate' requires exactly one argument: column_index")
             sys.exit(1)
-        return {"exe": op_exe, "args": None}
+
+        try:
+            col = int(op_args_list[0])
+        except ValueError:
+            print("Error: aggregate operator argument must be an integer column index.")
+            sys.exit(1)
+
+        return {"exe": op_exe, "args": col}
 
     if op_exe == "filter":
         if len(op_args_list) != 1:
@@ -120,12 +127,15 @@ def main():
         rest = rest[1:]
 
         op2_args_list = []
-        if op2_exe != "aggregate":
+        if op2_exe in ("filter", "transform", "aggregate"):
             if len(rest) == 0:
                 print(f"Error: missing argument for operator {op2_exe}.")
                 sys.exit(1)
             op2_args_list.append(rest[0])
             rest = rest[1:]
+        else:
+            print(f"Error: invalid operator for stage 2: {op2_exe}")
+            sys.exit(1)
 
         op2 = parse_operator(op2_exe, op2_args_list)
 
@@ -257,7 +267,7 @@ def main():
         
     print("Final job object:")
     print(job)
-    send_msg(job)
+    # send_msg(job)
 
 if __name__ == "__main__":
     main()
