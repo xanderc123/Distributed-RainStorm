@@ -231,68 +231,49 @@ class TaskThread(threading.Thread):
                 conn.close()
 
                 if data:
-                    # Parse RainStorm Tuple: "key, value"
-                    # Format produced by Source: "filename:linenumber, line_content"
-                    # Split only on the first comma
                     parts = data.split(",", 1)
                     if len(parts) < 2: 
                         continue
                     
                     key = parts[0].strip()
-                    line = parts[1].strip() # This is the actual data content
+                    line = parts[1].strip()
                     
                     op_type = self.operator["exe"]
                     processed_line = None
                     
                     if op_type == "filter":
                         if self.filter_pass(line):
-                            # Pass tuple forward preserving the format
                             processed_line = f"{key}, {line}" 
                         else:
-                            continue # Tuple filtered out
+                            continue
                     
                     elif op_type == "identity":
                         processed_line = f"{key}, {line}"
                     
                     elif op_type == "transform":
-                        # Transform usually modifies the Value, but Key (LineID) stays the same
                         new_line = self.transform_operator(line)
                         processed_line = f"{key}, {new_line}"
                     
                     elif op_type == "aggregate":
-                        # Aggregate changes the Key (Group By Key)
-                        # We extract the key and set value to 1 for now (to test flow)
-                        agg_key = self.extract_pivot_value(line)
-                        processed_line = f"{agg_key}, 1" 
+                        # --- 修正点：这里必须调用 aggregate_operator ---
+                        processed_line = self.aggregate_operator(key, line)
                                     
                     if processed_line is None:
                         continue
 
                     # --- Routing Logic ---
                     dest = None
-                    
-                    # 1. If there is a next stage, route it
                     if self.next_stage_tasks:
-                        routing_key = key # Default routing key
-                        
-                        # [cite: 76] "key for the input to the Replace stage is the line"
-                        # For aggregation, we MUST hash based on the content/value
+                        routing_key = key
                         if self.ag_column is not None and self.ag_column != "":
                             val_for_hash = self.extract_pivot_value(line)
                             routing_key = val_for_hash
-
                         dest = self.select_next_stage_task(routing_key)
-                        
                         if dest:
                             self.forward_tuple(processed_line, dest)
-
-                    # 2. If no next stage, this is the FINAL stage -> Output
                     else:
-                        # Output to Console 
                         print(f"[OUTPUT] {processed_line}")
                         self.log(f"[OUTPUT] {processed_line}")
-                        
-                        # Output to HyDFS 
                         if self.dest_filename:
                             append_hydfs_file(self.dest_filename, processed_line + "\n")
 
