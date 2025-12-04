@@ -189,13 +189,25 @@ class TaskThread(threading.Thread):
         return line.replace(old_str, new_str)
 
     def aggregate_operator(self, key, line):
-            # --- 修改: 实现真正的聚合逻辑  ---
-            # 1. 从行中提取聚合用的 Key (例如根据 Asset Category 列)
-            # 注意: 这里的 'key' 参数是上游传来的 Tuple Key (如 dataset1:100)，
-            # 但聚合通常是基于内容的 Key (如 "SIGN_GUIDE")。
+            # 修正: 聚合算子应该使用自己的参数 (operator["args"]) 作为列索引
+            # 而不是使用 self.ag_column (那是用于下游路由的)
             
-            agg_key = self.extract_pivot_value(line)
-            
+            try:
+                # 客户端解析时保证了 args 是 int，例如 6
+                col_idx = self.operator["args"]
+                
+                # 解析 CSV 行
+                parts = self.parse_csv_line(line)
+                
+                # 提取 Key
+                if parts and isinstance(col_idx, int) and col_idx < len(parts):
+                    agg_key = parts[col_idx].strip()
+                else:
+                    agg_key = "UNKNOWN_COL" # 标记列索引越界
+                    
+            except Exception as e:
+                agg_key = "PARSE_ERROR"
+
             # 2. 更新内存中的状态
             if agg_key not in self.state:
                 self.state[agg_key] = 0
@@ -204,7 +216,6 @@ class TaskThread(threading.Thread):
             current_count = self.state[agg_key]
             
             # 3. 返回新的聚合结果
-            # PDF 要求: "pass the aggregate to the next stage"
             return f"{agg_key}, {current_count}"
 
     def run(self):
