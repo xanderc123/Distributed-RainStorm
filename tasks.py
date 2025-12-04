@@ -134,6 +134,7 @@ class TaskThread(threading.Thread):
         self.ag_column = ag_column
         # New: Stores the destination filename for the final output
         self.dest_filename = dest_filename 
+        self.state = {}
 
     def log(self, msg):
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -188,9 +189,23 @@ class TaskThread(threading.Thread):
         return line.replace(old_str, new_str)
 
     def aggregate_operator(self, key, line):
-        # Placeholder for Stage 3 (Stateful aggregation)
-        # We will implement the actual state storage later
-        return f"{key}: 1" 
+            # --- 修改: 实现真正的聚合逻辑  ---
+            # 1. 从行中提取聚合用的 Key (例如根据 Asset Category 列)
+            # 注意: 这里的 'key' 参数是上游传来的 Tuple Key (如 dataset1:100)，
+            # 但聚合通常是基于内容的 Key (如 "SIGN_GUIDE")。
+            
+            agg_key = self.extract_pivot_value(line)
+            
+            # 2. 更新内存中的状态
+            if agg_key not in self.state:
+                self.state[agg_key] = 0
+            self.state[agg_key] += 1
+            
+            current_count = self.state[agg_key]
+            
+            # 3. 返回新的聚合结果
+            # PDF 要求: "pass the aggregate to the next stage"
+            return f"{agg_key}, {current_count}"
 
     def run(self):
         self.log(f"Task thread started on data port {self.port}")
