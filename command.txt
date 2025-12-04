@@ -2,6 +2,8 @@ nohup python3 membership.py --port 9000 --introducer fa25-cs425-9801.cs.illinois
 
 pkill -f membership.py
 
+list_mem_ids:
+python control.py list_mem_ids
 
 Leader：
 nohup python3 rainstorm_daemon.py --mode leader --logfile leader.log > leader_console.log 2>&1 &
@@ -16,3 +18,7 @@ python3 hydfs_client.py --hosts hosts.txt get output_test.txt get_result.txt
 
 ls：
 python3 hydfs_client.py --hosts hosts.txt ls output_test.txt
+
+python3 rainstorm_client.py 2 2 filter "Sign" aggregate 6 dataset1.csv output_agg_.txt false false 1000
+
+cat DFS/output_agg.txt/* | tail -n 20

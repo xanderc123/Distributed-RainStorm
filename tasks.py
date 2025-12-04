@@ -189,34 +189,32 @@ class TaskThread(threading.Thread):
         return line.replace(old_str, new_str)
 
     def aggregate_operator(self, key, line):
-            # 修正: 聚合算子应该使用自己的参数 (operator["args"]) 作为列索引
-            # 而不是使用 self.ag_column (那是用于下游路由的)
-            
-            try:
-                # 客户端解析时保证了 args 是 int，例如 6
-                col_idx = self.operator["args"]
-                
-                # 解析 CSV 行
-                parts = self.parse_csv_line(line)
-                
-                # 提取 Key
-                if parts and isinstance(col_idx, int) and col_idx < len(parts):
-                    agg_key = parts[col_idx].strip()
-                else:
-                    agg_key = "UNKNOWN_COL" # 标记列索引越界
-                    
-            except Exception as e:
-                agg_key = "PARSE_ERROR"
+        # 1. 获取列索引 (应为 6)
+        col_idx = self.operator["args"]
+        
+        # 2. 解析 CSV
+        parts = self.parse_csv_line(line)
+        
+        # --- 调试日志 (排错关键) ---
+        # 如果解析出的列数小于 7 (index 6 需要至少 7 列)，或者解析失败，打印详细信息
+        if len(parts) <= col_idx:
+            self.log(f"[DEBUG_FAIL] Index={col_idx}, PartsLen={len(parts)}")
+            self.log(f"[DEBUG_FAIL] Raw Line content: >>>{line}<<<")
+            agg_key = "DEBUG_UNKNOWN" 
+        else:
+            agg_key = parts[col_idx].strip()
+            # 如果成功，也偶尔打印一下证明代码更新了
+            if self.state.get(agg_key, 0) == 0: 
+                self.log(f"[DEBUG_SUCCESS] Found Key: {agg_key}")
 
-            # 2. 更新内存中的状态
-            if agg_key not in self.state:
-                self.state[agg_key] = 0
-            self.state[agg_key] += 1
-            
-            current_count = self.state[agg_key]
-            
-            # 3. 返回新的聚合结果
-            return f"{agg_key}, {current_count}"
+        # 3. 更新状态
+        if agg_key not in self.state:
+            self.state[agg_key] = 0
+        self.state[agg_key] += 1
+        
+        current_count = self.state[agg_key]
+        
+        return f"{agg_key}, {current_count}"
 
     def run(self):
         self.log(f"Task thread started on data port {self.port}")
