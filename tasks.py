@@ -1,10 +1,11 @@
-import threading
+import multiprocessing
 import time
 import socket
 import re
 import csv
 import json
 import struct
+import os
 
 # --- HyDFS Helper Functions (For Output) ---
 def send_tcp_request(port, req):
@@ -34,21 +35,18 @@ def send_tcp_request(port, req):
         s.close()
         return json.loads(resp_data.decode("utf-8"))
     except Exception as e:
-        print(f"[HyDFS Client Error] {e}")
+        # Silently fail or minimal log, as this runs frequently
         return None
 
 def append_hydfs_file(filename, content):
     """Appends content to a HyDFS file via the local daemon."""
-    # Try to append directly
     req = {
         "command": "append", 
         "remote_file": filename, 
         "content": content
     }
-    # Send to membership.py file system port (default 9002)
     resp = send_tcp_request(9002, req)
     
-    # If failed (e.g., file does not exist), try to create and write
     if not resp or not resp.get("ok"):
         create_req = {
             "command": "create",
@@ -59,27 +57,30 @@ def append_hydfs_file(filename, content):
 
 # ----------------------------------------------------
 
-class SourceThread(threading.Thread):
-    def __init__(self, filepath, stage0_tasks, input_rate, logfile):
-        super().__init__(daemon=True)
+class SourceProcess(multiprocessing.Process):
+    def __init__(self, filepath, stage0_tasks, input_rate, log_dir="."):
+        super().__init__()
         self.filepath = filepath
         self.tasks = stage0_tasks
         self.input_rate = input_rate
-        self.logfile = logfile
+        # Create a unique log file for this run
+        self.log_file = os.path.join(log_dir, f"source_{int(time.time())}.log")
         self.running = True
 
     def log(self, msg):
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{timestamp}] [SOURCE] {msg}"
-        with open(self.logfile, "a") as f:
+        with open(self.log_file, "a") as f:
             f.write(line + "\n")
-        print(line, flush=True)
+        # Optional: Print to stdout for debugging, but might clutter
+        # print(line, flush=True) 
 
     def run(self):
-        self.log(f"SourceThread started (Reading Local File: {self.filepath})")
+        # Important: Re-import socket inside process if needed, though usually fine.
+        self.log(f"SourceProcess started. PID: {os.getpid()}")
+        self.log(f"Reading Local File: {self.filepath}")
 
         try:
-            # Currently reading local file for testing purposes
             with open(self.filepath, "r") as f:
                 lines = f.readlines()
         except Exception as e:
@@ -91,21 +92,13 @@ class SourceThread(threading.Thread):
             return
 
         interval = 1.0 / max(1, self.input_rate)
-
-        # Skip the CSV Header (Row 0)
         start_index = 1 
         
+        # Main Loop
         for idx, line in enumerate(lines[start_index:], start_index):
-            if not self.running:
-                break
-
-            # Format: <filename:linenumber, line>
-            #  "produce the source stream of <filename:linenumber, line> tuples"
             data_tuple = f"{self.filepath}:{idx}, {line.strip()}"
             
-            # Simple round-robin distribution to stage 1 tasks
             task = self.tasks[idx % len(self.tasks)]
-            
             vm = task["vm"]
             port = task["port"]
 
@@ -119,37 +112,37 @@ class SourceThread(threading.Thread):
 
             time.sleep(interval)
 
-        self.log("SourceThread finished")
+        self.log("SourceProcess finished")
 
 
-class TaskThread(threading.Thread):
-    def __init__(self, task_id, operator, port, logfile, next_stage_tasks=None, ag_column=None, dest_filename=None):
-        super().__init__(daemon=True)
+class TaskProcess(multiprocessing.Process):
+    def __init__(self, task_id, operator, port, log_dir, next_stage_tasks=None, ag_column=None, dest_filename=None):
+        super().__init__()
         self.task_id = task_id
         self.operator = operator
         self.port = port
-        self.logfile = logfile
-        self.running = True
+        self.log_dir = log_dir
         self.next_stage_tasks = next_stage_tasks
         self.ag_column = ag_column
-        # New: Stores the destination filename for the final output
         self.dest_filename = dest_filename 
-        self.state = {}
+        
+        # Determine Log Filename: task_<task_id>_<timestamp>.log
+        self.log_file = os.path.join(self.log_dir, f"task_{self.task_id}_{int(time.time())}.log")
+        
+        # State will be initialized in run() to ensure process-safety
+        self.state = {} 
 
     def log(self, msg):
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        line = msg
-        with open(self.logfile, "a") as f:
+        line = f"[{timestamp}] {msg}"
+        with open(self.log_file, "a") as f:
             f.write(line + "\n")
-        print(line, flush=True)
+        # print(line, flush=True)
 
     def filter_pass(self, line):
         pattern = self.operator["args"]
         return re.search(pattern, line) is not None
     
-    def identity_operator(self, line):
-        return line
-
     def parse_csv_line(self, line):
         try:
             return next(csv.reader([line]))
@@ -158,7 +151,6 @@ class TaskThread(threading.Thread):
 
     def extract_pivot_value(self, line):
         parts = self.parse_csv_line(line)
-        # Ensure column index is valid
         if parts and isinstance(self.ag_column, int) and self.ag_column < len(parts):
             key = parts[self.ag_column].strip()
             return key
@@ -168,8 +160,6 @@ class TaskThread(threading.Thread):
     def select_next_stage_task(self, key):
         if not self.next_stage_tasks:
             return None
-        # Use Hash Partitioning to ensure stateful operations go to the same task
-        # [cite: 78] "use hash partitioning on the key modulo the number of tasks"
         idx = hash(key) % len(self.next_stage_tasks)
         return self.next_stage_tasks[idx]
 
@@ -183,48 +173,58 @@ class TaskThread(threading.Thread):
             self.log(f"Routing error to {dest}: {e}")
 
     def transform_operator(self, line):
-        # Example Transform: String Replacement
-        # Assumes args is a list or tuple: [old_str, new_str]
-        old_str, new_str = self.operator["args"]
-        return line.replace(old_str, new_str)
+        # Demo Application 2: Output fields 1-3
+        # args format for demo might be different, but let's stick to spec
+        # "Output fields 1-3 of the line"
+        if self.operator["exe"] == "transform":
+             # Demo-specific logic for App 2 if args say so, or generic
+             # Let's assume generic transform for now based on args
+             # But for Demo App 2, we might need a specific flag or flexible arg
+             pass
+        
+        # Existing generic logic
+        if isinstance(self.operator["args"], (list, tuple)):
+            old_str, new_str = self.operator["args"]
+            return line.replace(old_str, new_str)
+        return line
 
     def aggregate_operator(self, key, line):
-        # 1. 获取列索引 (应为 6)
-        col_idx = self.operator["args"]
-        
-        # 2. 解析 CSV
-        parts = self.parse_csv_line(line)
-        
-        # --- 调试日志 (排错关键) ---
-        # 如果解析出的列数小于 7 (index 6 需要至少 7 列)，或者解析失败，打印详细信息
-        if len(parts) <= col_idx:
-            self.log(f"[DEBUG_FAIL] Index={col_idx}, PartsLen={len(parts)}")
-            self.log(f"[DEBUG_FAIL] Raw Line content: >>>{line}<<<")
-            agg_key = "DEBUG_UNKNOWN" 
-        else:
-            agg_key = parts[col_idx].strip()
-            # 如果成功，也偶尔打印一下证明代码更新了
-            if self.state.get(agg_key, 0) == 0: 
-                self.log(f"[DEBUG_SUCCESS] Found Key: {agg_key}")
+        try:
+            col_idx = self.operator["args"]
+            parts = self.parse_csv_line(line)
+            if len(parts) > col_idx:
+                agg_key = parts[col_idx].strip()
+                if not agg_key: agg_key = "Empty" # Handle missing data
+            else:
+                agg_key = "Empty"
+        except:
+            agg_key = "Error"
 
-        # 3. 更新状态
+        # Update state
         if agg_key not in self.state:
             self.state[agg_key] = 0
         self.state[agg_key] += 1
         
         current_count = self.state[agg_key]
-        
         return f"{agg_key}, {current_count}"
 
     def run(self):
-        self.log(f"Task thread started on data port {self.port}")
+        # Re-initialize state here to be safe
+        self.state = {}
+        
+        self.log(f"Task Process Started. PID: {os.getpid()}, Port: {self.port}")
+        self.log(f"Operator: {self.operator}")
 
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.bind(("0.0.0.0", self.port))
-        server.listen(5)
+        try:
+            server.bind(("0.0.0.0", self.port))
+            server.listen(5)
+        except Exception as e:
+            self.log(f"FATAL: Could not bind to port {self.port}: {e}")
+            return
 
-        while self.running:
+        while True:
             try:
                 conn, addr = server.accept()
                 data = conn.recv(65535).decode("utf-8").strip()
@@ -244,25 +244,34 @@ class TaskThread(threading.Thread):
                     if op_type == "filter":
                         if self.filter_pass(line):
                             processed_line = f"{key}, {line}" 
-                        else:
-                            continue
                     
                     elif op_type == "identity":
                         processed_line = f"{key}, {line}"
                     
                     elif op_type == "transform":
-                        new_line = self.transform_operator(line)
-                        processed_line = f"{key}, {new_line}"
+                        # For Demo App 2: "Output fields 1-3"
+                        # We can hack this: if arg is "cut1-3", do the split
+                        if self.operator.get("args") == "cut1-3":
+                             csv_parts = self.parse_csv_line(line)
+                             # Take first 3 fields
+                             cut_res = ",".join(csv_parts[:3])
+                             processed_line = f"{key}, {cut_res}"
+                        else:
+                             # Default replace logic
+                             new_line = self.transform_operator(line)
+                             processed_line = f"{key}, {new_line}"
                     
                     elif op_type == "aggregate":
-                        # --- 修正点：这里必须调用 aggregate_operator ---
                         processed_line = self.aggregate_operator(key, line)
                                     
                     if processed_line is None:
                         continue
 
-                    # --- Routing Logic ---
-                    dest = None
+                    # --- Routing / Output ---
+                    
+                    # Demo Requirement: "Log Each task’s output tuples"
+                    self.log(f"[OUTPUT_TUPLE] {processed_line}")
+
                     if self.next_stage_tasks:
                         routing_key = key
                         if self.ag_column is not None and self.ag_column != "":
@@ -272,11 +281,11 @@ class TaskThread(threading.Thread):
                         if dest:
                             self.forward_tuple(processed_line, dest)
                     else:
+                        # Final Stage Output
                         print(f"[OUTPUT] {processed_line}")
-                        self.log(f"[OUTPUT] {processed_line}")
                         if self.dest_filename:
                             append_hydfs_file(self.dest_filename, processed_line + "\n")
 
             except Exception as e:
                 self.log(f"Error on task data port: {e}")
-                time.sleep(0.2)
+                # Don't exit loop, just retry
