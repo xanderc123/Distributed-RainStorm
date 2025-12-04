@@ -8,6 +8,7 @@ import threading
 import re
 from uuid import uuid4
 
+# Import modified threads from tasks.py
 from tasks import SourceThread, TaskThread
 
 class RainstormLeader:
@@ -37,7 +38,7 @@ class RainstormLeader:
         limit = 10050
 
         if vm_ip not in self.vm_next_port:
-            # First port assignment
+            # First port assignment for this VM
             self.vm_next_port[vm_ip] = base
             return base
 
@@ -59,7 +60,6 @@ class RainstormLeader:
     def sendJSON(self, obj: dict, addr_tuple) -> int:
         data = json.dumps(obj, separators=(",", ":")).encode("utf-8")
         sent = self.sock.sendto(data, addr_tuple)
-        # self.bytes_out += sent
         return sent
 
     def retrieve_alive_members(self):
@@ -76,6 +76,7 @@ class RainstormLeader:
                 return []
 
             split_data = data.split()
+            # Filter for fa25-cs425 hosts
             members = [n.split(":")[0] for n in split_data if "fa25-cs425" in n]
             return members
 
@@ -94,7 +95,7 @@ class RainstormLeader:
     def handle_tasks_on_membership_change(self, old_members, new_members):
         self.log(f"Old: {old_members}")
         self.log(f"New: {new_members}")
-        # TODO: Handling task rearrangement in case of membership change
+        # TODO: Handling task rearrangement in case of membership change (Stage 3)
     
     def list_tasks(self):
         return self.tasks
@@ -107,9 +108,8 @@ class RainstormLeader:
 
         while True:
             conn, addr = srv.accept()
-            data = conn.recv(65535).decode("utf-8")
-
             try:
+                data = conn.recv(65535).decode("utf-8")
                 msg = json.loads(data)
                 
                 if msg["command"] == "LIST_TASKS":
@@ -119,12 +119,11 @@ class RainstormLeader:
                     pass
                 elif msg["command"] == "SUBMIT_JOB":
                     self.handle_job_submission(msg)
-                    conn.sendall("".encode())
+                    conn.sendall("OK".encode())
                 else:
                     conn.sendall(b"ERROR: Unknown command")
-                    conn.close()
             except Exception as e:
-                print("[Leader] Invalid command received:", e)
+                print("[Leader] Invalid command or connection error:", e)
             finally:
                 conn.close()
 
@@ -140,6 +139,8 @@ class RainstormLeader:
         Nstages = job["Nstages"]
         Ntasks = job["Ntasks_per_stage"]
         operators = job["operators"]
+        # Extract the destination filename from the job request
+        hydfs_dest_filename = job.get("hydfs_dest_filename") 
 
         workers = list(self.members)
 
@@ -147,18 +148,15 @@ class RainstormLeader:
             self.log("[Leader] ERROR: No workers available!")
             return
 
-        # Step 2: generate tasks
+        # Step 2: Generate tasks
         task_assignments = []  # list of (task_id, vm_ip, port, operator_info)
-
-        # PORT: IS IT UDP OR TCP
-        next_port = 10000
 
         for stage in range(Nstages):
             op = operators[stage]
 
             for i in range(Ntasks):
                 task_id = uuid4().int
-                vm_ip = workers[(task_id) % len(workers)]
+                vm_ip = workers[(task_id) % len(workers)] # Simple Round-Robin for now
 
                 task_info = {
                     "task_id": task_id,
@@ -166,26 +164,32 @@ class RainstormLeader:
                     "vm": vm_ip,
                     "port": self.allocate_port_for_vm(vm_ip),
                     "operator": op,
-                    "ag_column": self.add_aggregate_column(operators[stage + 1]) if stage == 0 else ""
+                    # If this is the source feeding into Stage 1, we need to know the aggregation column if Stage 1 is Agg
+                    # Actually logic: if NEXT stage is agg, current stage needs to partition by that column.
+                    # Current simplifiction: Source checks Stage 1.
+                    "ag_column": self.add_aggregate_column(operators[stage + 1]) if stage == 0 and (stage + 1 < Nstages) else "",
+                    # Pass the destination filename to the task info
+                    "dest_filename": hydfs_dest_filename
                 }
 
                 task_assignments.append(task_info)
 
-        # # Step 3: save routing table
+        # Step 3: Update local task table
         self.tasks += task_assignments
-        # self.log(f"[Leader] Routing table: {self.tasks}")
 
-        # # Step 4: send START_TASK to each worker
+        # Step 4: Send START_TASK to each worker
         for t in task_assignments:
             self.send_start_task(t)
 
-        # # --- START SOURCE FOR STAGE 0 ---
+        # --- START SOURCE FOR STAGE 0 ---
+        # Identify stage 1 tasks to feed data into
         stage0_tasks = [t for t in task_assignments if t["stage"] == 1]
         src_file = job["hydfs_src_directory"]
         input_rate = job["input_rate"]
 
+        # Start the Source Thread on the Leader
         source = SourceThread(src_file, stage0_tasks, input_rate, self.logfile)
-        source.run()
+        source.start()
         self.log("[Leader] Source thread started")
 
     def send_start_task(self, task):
@@ -195,11 +199,14 @@ class RainstormLeader:
             "stage": task["stage"],
             "port": task["port"],
             "operator": task["operator"],
-            "ag_column": task["ag_column"]
+            "ag_column": task["ag_column"],
+            # Include dest_filename in the message to the worker
+            "dest_filename": task["dest_filename"]
         }
 
         vm = task["vm"]
 
+        # If this is Stage 1, it needs to know about Stage 2 tasks for routing
         if task["stage"] == 1:
             stage2 = [t for t in self.tasks if t["stage"] == 2]
             msg["next_stage_tasks"] = [
@@ -209,12 +216,9 @@ class RainstormLeader:
 
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.connect((vm, 9200))
+            s.connect((vm, 9200)) # 9200 is the Worker listening port
             s.sendall(json.dumps(msg).encode())
             s.close()
-
-            # self.log(f"[Leader] Sent START_TASK to {vm}: {msg}")
-
         except Exception as e:
             self.log(f"[Leader] Failed to contact worker {vm}: {e}")
 
@@ -281,12 +285,11 @@ class RainstormWorker:
         port = task_info.get("port")
         next_stage_tasks = task_info.get("next_stage_tasks")
         ag_column = task_info.get("ag_column")
+        # Extract dest_filename from the message
+        dest_filename = task_info.get("dest_filename")
 
-        # self.log(f"[Worker] START_TASK received → id={task_id}, operator={operator}, port={port}")
-        # self.log(f"Next stage tasks: {str(next_stage_tasks)}")
-        # self.log("operator")
-        # self.log(task_info)
-        t = TaskThread(task_id, operator, port, self.logfile, next_stage_tasks, ag_column)
+        # Create TaskThread with the new dest_filename argument
+        t = TaskThread(task_id, operator, port, self.logfile, next_stage_tasks, ag_column, dest_filename)
         t.start()
 
         self.running_tasks[task_id] = {

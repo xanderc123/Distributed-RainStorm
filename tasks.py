@@ -5,6 +5,7 @@ import re
 import csv
 import json
 import struct
+
 # --- HyDFS Helper Functions (For Output) ---
 def send_tcp_request(port, req):
     """Connects to the local HyDFS service and sends a request."""
@@ -56,6 +57,71 @@ def append_hydfs_file(filename, content):
         }
         send_tcp_request(9002, create_req)
 
+# ----------------------------------------------------
+
+class SourceThread(threading.Thread):
+    def __init__(self, filepath, stage0_tasks, input_rate, logfile):
+        super().__init__(daemon=True)
+        self.filepath = filepath
+        self.tasks = stage0_tasks
+        self.input_rate = input_rate
+        self.logfile = logfile
+        self.running = True
+
+    def log(self, msg):
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        line = f"[{timestamp}] [SOURCE] {msg}"
+        with open(self.logfile, "a") as f:
+            f.write(line + "\n")
+        print(line, flush=True)
+
+    def run(self):
+        self.log(f"SourceThread started (Reading Local File: {self.filepath})")
+
+        try:
+            # Currently reading local file for testing purposes
+            with open(self.filepath, "r") as f:
+                lines = f.readlines()
+        except Exception as e:
+            self.log(f"Cannot read source file: {e}")
+            return
+
+        if not self.tasks:
+            self.log("ERROR: No stage-0 tasks available")
+            return
+
+        interval = 1.0 / max(1, self.input_rate)
+
+        # Skip the CSV Header (Row 0)
+        start_index = 1 
+        
+        for idx, line in enumerate(lines[start_index:], start_index):
+            if not self.running:
+                break
+
+            # Format: <filename:linenumber, line>
+            #  "produce the source stream of <filename:linenumber, line> tuples"
+            data_tuple = f"{self.filepath}:{idx}, {line.strip()}"
+            
+            # Simple round-robin distribution to stage 1 tasks
+            task = self.tasks[idx % len(self.tasks)]
+            
+            vm = task["vm"]
+            port = task["port"]
+
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.connect((vm, port))
+                s.sendall(data_tuple.encode())
+                s.close()
+            except Exception as e:
+                self.log(f"Failed to send to {vm}:{port} – {e}")
+
+            time.sleep(interval)
+
+        self.log("SourceThread finished")
+
+
 class TaskThread(threading.Thread):
     def __init__(self, task_id, operator, port, logfile, next_stage_tasks=None, ag_column=None, dest_filename=None):
         super().__init__(daemon=True)
@@ -102,7 +168,7 @@ class TaskThread(threading.Thread):
         if not self.next_stage_tasks:
             return None
         # Use Hash Partitioning to ensure stateful operations go to the same task
-        # "use hash partitioning on the key modulo the number of tasks"
+        # [cite: 78] "use hash partitioning on the key modulo the number of tasks"
         idx = hash(key) % len(self.next_stage_tasks)
         return self.next_stage_tasks[idx]
 
@@ -185,7 +251,7 @@ class TaskThread(threading.Thread):
                     if self.next_stage_tasks:
                         routing_key = key # Default routing key
                         
-                        # "key for the input to the Replace stage is the line"
+                        # [cite: 76] "key for the input to the Replace stage is the line"
                         # For aggregation, we MUST hash based on the content/value
                         if self.ag_column is not None and self.ag_column != "":
                             val_for_hash = self.extract_pivot_value(line)
