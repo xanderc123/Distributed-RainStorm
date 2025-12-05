@@ -182,6 +182,11 @@ class RainstormLeader:
         workers = list(self.members)
         if not workers: return
 
+        self.autoscale_enabled = job.get("autoscale_enabled", False)
+        self.LW = job.get("LW")
+        self.HW = job.get("HW")
+        self.cooldown_timer = {} # 记录每个 Stage 上次伸缩的时间 {stage_num: timestamp}
+
         new_tasks = []
         for stage in range(Nstages):
             op = operators[stage]
@@ -207,6 +212,7 @@ class RainstormLeader:
         st0 = [t for t in new_tasks if t["stage"]==1]
         SourceProcess(src_file, st0, input_rate, ".").start()
         self.log("[Leader] Job started.")
+        self.log("[Leader] Job started with Autoscale=" + str(self.autoscale_enabled))
 
     def send_start_task(self, task):
         msg = {
@@ -226,8 +232,121 @@ class RainstormLeader:
         except Exception as e:
             self.log(f"Failed to start task on {task['vm']}: {e}")
 
+    def autoscale_monitor_loop(self):
+        while True:
+            time.sleep(2.0) # 每2秒检查一次
+            
+            if not getattr(self, "autoscale_enabled", False):
+                continue
+            
+            # 1. 计算每个 Stage 的平均速率
+            stage_rates = {} # {stage: [rate1, rate2, ...]}
+            
+            with self.lock:
+                for t in self.tasks:
+                    s = t["stage"]
+                    r = t.get("current_rate", 0)
+                    if s not in stage_rates: stage_rates[s] = []
+                    stage_rates[s].append(r)
+
+            # 2. 检查每个 Stage 是否需要伸缩
+            for stage, rates in stage_rates.items():
+                if not rates: continue
+                
+                # 只有 Stage 2 (或非 Source Stage) 需要伸缩
+                # Source (Stage 0/Internal) 不归我们管，Stage 1 也可以伸缩
+                
+                avg_rate = sum(rates) / len(rates)
+                
+                # 检查冷却时间 (假设冷却 5 秒)
+                last_scale = self.cooldown_timer.get(stage, 0)
+                if time.time() - last_scale < 5:
+                    continue
+
+                # 判定逻辑
+                if self.HW and avg_rate > self.HW:
+                    self.log(f"[Autoscale] Stage {stage} AvgRate {avg_rate:.2f} > HW {self.HW}. Scaling UP.")
+                    self.scale_up_stage(stage)
+                    self.cooldown_timer[stage] = time.time()
+                    
+                elif self.LW and avg_rate < self.LW:
+                    # 只有当 Task 数大于 1 时才缩容
+                    if len(rates) > 1:
+                        self.log(f"[Autoscale] Stage {stage} AvgRate {avg_rate:.2f} < LW {self.LW}. Scaling DOWN.")
+                        self.scale_down_stage(stage)
+                        self.cooldown_timer[stage] = time.time()
+
+    def scale_up_stage(self, stage):
+        """增加一个 Task 到指定 Stage"""
+        with self.lock:
+            # 1. 复制该 Stage 的 Operator 配置 (找一个现成的 Task)
+            template_task = None
+            for t in self.tasks:
+                if t["stage"] == stage:
+                    template_task = t
+                    break
+            if not template_task: return
+
+            # 2. 创建新 Task
+            workers = list(self.members)
+            if not workers: return
+            
+            new_tid = uuid4().int
+            # 简单的负载均衡: 随机选一个节点
+            target_vm = workers[new_tid % len(workers)]
+            
+            new_task = {
+                "task_id": new_tid,
+                "stage": stage,
+                "vm": target_vm,
+                "port": self.allocate_port_for_vm(target_vm),
+                "operator": template_task["operator"],
+                "ag_column": template_task["ag_column"],
+                "dest_filename": template_task["dest_filename"],
+                "pid": None, "logfile": None, "current_rate": 0
+            }
+            
+            self.tasks.append(new_task)
+            self.log(f"[ScaleUp] Started new Task {new_tid} on {target_vm}")
+            
+            # 3. 启动新任务
+            self.send_start_task(new_task)
+            
+            # 4. 更新上游路由 (让 Stage N-1 知道这个新 Task 的存在)
+            # 我们直接全量更新所有任务路由，最简单安全
+            self.update_routing_tables()
+            
+    def scale_down_stage(self, stage):
+        victim = None
+        with self.lock:
+            candidates = [t for t in self.tasks if t["stage"] == stage]
+            if len(candidates) <= 1: return
+            victim = candidates[-1] # 牺牲者
+            
+            # 从列表中移除
+            self.tasks.remove(victim)
+
+        if victim and victim.get("pid"):
+            self.log(f"[ScaleDown] Removing Task {victim['task_id']} PID {victim['pid']}")
+            # 通知 Worker 杀掉进程
+            self.send_kill_command_by_pid(victim["vm"], victim["pid"])
+        
+        # 更新路由
+        self.update_routing_tables()
+
+    def send_kill_command_by_pid(self, vm, pid):
+        try:
+            msg = {"command": "KILL_TASK", "pid": pid}
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((vm, 9200))
+            s.sendall(json.dumps(msg).encode())
+            s.close()
+        except Exception as e:
+            self.log(f"Failed to send KILL to {vm}: {e}")
+
     def run(self):
         threading.Thread(target=self.membership_check_loop, daemon=True).start()
+        threading.Thread(target=self.autoscale_monitor_loop, daemon=True).start()
         self.log(f"[Leader] Listening on {self.port}")
         self.listen()
 
