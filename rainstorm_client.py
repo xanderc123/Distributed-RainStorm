@@ -14,6 +14,7 @@ def parse_operator(op_exe, op_args_list):
         print(f"Error: invalid operator '{op_exe}'.")
         sys.exit(1)
     
+    # 修复 1: Identity 支持
     if op_exe == "identity":
         return {"exe": op_exe, "args": None}
 
@@ -23,20 +24,16 @@ def parse_operator(op_exe, op_args_list):
     if op_exe == "filter":
         return {"exe": op_exe, "args": op_args_list[0]}
     
+    # 修复 2: Transform 支持单参数 (兼容 cut1-3)
     if op_exe == "transform":
-  
         if len(op_args_list) == 1:
-            # 如果是 "old new" 这种带空格的，切分成 tuple
             if ' ' in op_args_list[0]:
                 parts = op_args_list[0].split()
                 return {"exe": op_exe, "args": (parts[0], parts[1])}
-            # 否则直接返回单个字符串 (例如 "cut1-3")
             else:
-                return {"exe": op_exe, "args": op_args_list[0]}   
-        # 情况 2: 有两个参数 (例如: transform old new)
+                return {"exe": op_exe, "args": op_args_list[0]}
         if len(op_args_list) >= 2:
             return {"exe": op_exe, "args": (op_args_list[0], op_args_list[1])}
-        # --- 修复逻辑结束 ---
             
     return None
 
@@ -120,14 +117,13 @@ def main():
         operators = []
         rest = args.rest
         
-        # Op 1
         if not rest:
-            print("Error: Missing operators")
             sys.exit(1)
 
         op1_exe = rest[0]; rest = rest[1:]
         op1_args = []
         
+        # Identity 处理逻辑
         if op1_exe == "identity":
              if rest and rest[0] == "": rest = rest[1:]
         elif op1_exe != "aggregate":
@@ -136,7 +132,6 @@ def main():
              op1_args.append(rest[0]); rest = rest[1:]
         operators.append(parse_operator(op1_exe, op1_args))
 
-        # Op 2
         if args.Nstages == 2:
             op2_exe = rest[0]; rest = rest[1:]
             op2_args = []
