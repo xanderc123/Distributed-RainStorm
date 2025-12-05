@@ -85,45 +85,39 @@ class SourceProcess(multiprocessing.Process):
 
         if not self.tasks: return
 
-        # 计算间隔
         interval = 1.0 / max(1, self.input_rate)
-        # 如果速率很高(>100)，sleep 精度可能不够，我们采用 batch sleep 或不 sleep
-        # 为了演示 AutoScale，我们尽可能全速发送，只用 interval 做最小控制
-        
         start_index = 1 
         last_time = time.time()
         
         for idx, line in enumerate(lines[start_index:], start_index):
             data_tuple = f"{self.filepath}:{idx}, {line.strip()}"
-            
             task = self.tasks[idx % len(self.tasks)]
             
-            # --- 使用持久连接 ---
             s = self.get_socket(task["vm"], task["port"])
             if s:
                 try:
-                    s.sendall(data_tuple.encode() + b"\n") 
-                    pass
+                    s.sendall(data_tuple.encode() + b"\n")
                 except Exception as e:
                     self.log(f"Send Error: {e}")
-                    # 如果出错，移除缓存重连
                     if (task["vm"], task["port"]) in self.sockets:
                         del self.sockets[(task["vm"], task["port"])]
             
-            # 为了简单起见，如果 Task 端没改，Source 这里还是得 Close。
-            # 为了让你现在能跑通，我先 revert 到短连接，但建议你把 HW 调低测试。
-            s.close() 
+            # --- 修复点: 只有 s 存在时才关闭 ---
+            if s:
+                try:
+                    s.close()
+                except: pass
+                
             if (task["vm"], task["port"]) in self.sockets:
                 del self.sockets[(task["vm"], task["port"])]
+            # ----------------------------------
 
-            # 速率控制
             now = time.time()
             if now - last_time < interval:
                 time.sleep(interval - (now - last_time))
             last_time = time.time()
 
         self.log("SourceProcess finished")
-
 
 class TaskProcess(multiprocessing.Process):
     def __init__(self, task_id, operator, port, log_dir, next_stage_tasks=None, ag_column=None, dest_filename=None, shared_counter=None):
