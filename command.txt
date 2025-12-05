@@ -5,7 +5,7 @@ pkill -9 -f python3
 # 清理旧日志 (方便观察)
 rm -f leader.log worker.log task_*.log
 
-nohup python3 membership.py --port 9000 --introducer fa25-cs425-9801.cs.illinois.edu:9000 --mode pingack --drop 0.0 --t_fail 2 --t_suspect 1.8 --t_cleanup 2 > membership_bg.log 2>&1 &
+nohup python3 membership.py --port 9000 --introducer fa25-cs425-9801.cs.illinois.edu:9000 --mode pingack --drop 0.0 --t_fail 2.5 --t_suspect 1.9 --t_cleanup 2 > membership_bg.log 2>&1 &
 
 pkill -f membership.py
 

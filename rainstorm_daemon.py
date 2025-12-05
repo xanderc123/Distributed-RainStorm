@@ -61,7 +61,7 @@ class RainstormLeader:
                 conn.sendall(json.dumps(self.tasks).encode())
             elif cmd == "SUBMIT_JOB":
                 self.handle_job_submission(msg)
-                conn.sendall("OK".encode())
+                conn.sendall(json.dumps("OK").encode())
             elif cmd == "UPDATE_PID":
                 self.handle_update_pid(msg)
                 conn.sendall("OK".encode())
