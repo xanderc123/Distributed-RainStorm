@@ -64,10 +64,10 @@ class RainstormLeader:
                 conn.sendall(json.dumps("OK").encode())
             elif cmd == "UPDATE_PID":
                 self.handle_update_pid(msg)
-                conn.sendall("OK".encode())
+                conn.sendall(json.dumps("OK").encode())
             elif cmd == "TASK_FAILED": # <-- New: Handle failure report
                 self.handle_task_failure(msg)
-                conn.sendall("OK".encode())
+                conn.sendall(json.dumps("OK").encode())
             elif cmd == "UPDATE_RATES":
                 self.handle_rate_updates(msg.get("updates"))
 

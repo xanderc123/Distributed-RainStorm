@@ -3,7 +3,6 @@ import sys
 import socket
 import json
 
-# --- 修改 1: 添加 "identity" ---
 VALID_OPS = {"transform", "filter", "aggregate", "identity"}
 
 LEADER_IP = "fa25-cs425-9801.cs.illinois.edu"
@@ -15,20 +14,30 @@ def parse_operator(op_exe, op_args_list):
         print(f"Error: invalid operator '{op_exe}'.")
         sys.exit(1)
     
-    # --- 修改 2: 处理 identity ---
     if op_exe == "identity":
-        # Identity 不需要任何参数，直接返回
         return {"exe": op_exe, "args": None}
 
     if op_exe == "aggregate":
         return {"exe": op_exe, "args": int(op_args_list[0])}
+    
     if op_exe == "filter":
         return {"exe": op_exe, "args": op_args_list[0]}
+    
     if op_exe == "transform":
-        if len(op_args_list) == 1 and ' ' in op_args_list[0]:
-            parts = op_args_list[0].split()
-            return {"exe": op_exe, "args": (parts[0], parts[1])}
-        return {"exe": op_exe, "args": (op_args_list[0], op_args_list[1])}
+  
+        if len(op_args_list) == 1:
+            # 如果是 "old new" 这种带空格的，切分成 tuple
+            if ' ' in op_args_list[0]:
+                parts = op_args_list[0].split()
+                return {"exe": op_exe, "args": (parts[0], parts[1])}
+            # 否则直接返回单个字符串 (例如 "cut1-3")
+            else:
+                return {"exe": op_exe, "args": op_args_list[0]}   
+        # 情况 2: 有两个参数 (例如: transform old new)
+        if len(op_args_list) >= 2:
+            return {"exe": op_exe, "args": (op_args_list[0], op_args_list[1])}
+        # --- 修复逻辑结束 ---
+            
     return None
 
 def send_msg_to_leader(msg):
@@ -111,7 +120,7 @@ def main():
         operators = []
         rest = args.rest
         
-        # 解析 Operator 1
+        # Op 1
         if not rest:
             print("Error: Missing operators")
             sys.exit(1)
@@ -119,27 +128,19 @@ def main():
         op1_exe = rest[0]; rest = rest[1:]
         op1_args = []
         
-        # --- 修改 3: Identity/Aggregate 只需要解析 exe 不需要后面跟 args (或者可以跟空字符串占位) ---
-        # 你的命令是: identity "" ...
-        # aggregate 后面跟了 6
-        # filter 后面跟了 "Sign"
         if op1_exe == "identity":
-             # 如果命令行传了 "" 占位符，我们需要把它消耗掉，以免错位
-             if rest and rest[0] == "":
-                 rest = rest[1:]
-             # 如果不是空串，说明后面直接跟的是 file，不用管，parse_operator 会处理 args=None
+             if rest and rest[0] == "": rest = rest[1:]
         elif op1_exe != "aggregate":
              op1_args.append(rest[0]); rest = rest[1:]
         else:
              op1_args.append(rest[0]); rest = rest[1:]
-
         operators.append(parse_operator(op1_exe, op1_args))
 
-        # 解析 Operator 2 (如果 Nstages=2)
+        # Op 2
         if args.Nstages == 2:
             op2_exe = rest[0]; rest = rest[1:]
             op2_args = []
-            if op2_exe == "identity": # 一般不会作为 Stage 2，但为了健壮性
+            if op2_exe == "identity":
                  if rest and rest[0] == "": rest = rest[1:]
             else:
                  op2_args.append(rest[0]); rest = rest[1:]

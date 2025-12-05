@@ -1060,18 +1060,6 @@ class Daemon:
                     shutil.rmtree(file_path)
             self.log("Storage directory cleaned")
 
-    def forward_append_to_replica(self, hostname, req):
-        file_server_port = 9002
-        response = []
-        with socket.create_connection((hostname, file_server_port), timeout=10) as s:
-            s.settimeout(10)
-            send(s, req)
-            resp = recv_msg(s)
-            if resp.get("ok"):
-                msg = f"Success: Append on secondary replica {hostname} is completed."
-            else:
-                msg = f"Error: Append failed on secondary replica {hostname}. Returned error: {resp.get('error', 'Unknown error')}"
-            self.log(msg)
 
     # New Thread 1 logic: Handle file clients (from server.py)
     def handle_file_client_verification(self, conn, addr):
