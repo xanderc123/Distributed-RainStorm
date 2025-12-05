@@ -17,8 +17,10 @@ def parse_operator(op_exe, op_args_list):
     if op_exe == "filter":
         return {"exe": op_exe, "args": op_args_list[0]}
     if op_exe == "transform":
-        parts = op_args_list[0].split()
-        return {"exe": op_exe, "args": (parts[0], parts[1])}
+        if len(op_args_list) == 1 and ' ' in op_args_list[0]:
+            parts = op_args_list[0].split()
+            return {"exe": op_exe, "args": (parts[0], parts[1])}
+        return {"exe": op_exe, "args": (op_args_list[0], op_args_list[1])}
     return None
 
 def send_msg_to_leader(msg):
@@ -91,7 +93,6 @@ def main():
         parser.add_argument("Ntasks_per_stage", type=int)
         parser.add_argument("rest", nargs=argparse.REMAINDER)
         
-        # Hack to skip the first arg if it matches Nstages format, else sys.argv logic handles it
         try:
             args = parser.parse_args(sys.argv[1:])
         except:
@@ -100,16 +101,14 @@ def main():
         operators = []
         rest = args.rest
         
-        # Op 1
         op1_exe = rest[0]; rest = rest[1:]
         op1_args = []
         if op1_exe != "aggregate":
              op1_args.append(rest[0]); rest = rest[1:]
         else:
-             op1_args.append(rest[0]); rest = rest[1:] # agg also takes 1 arg
+             op1_args.append(rest[0]); rest = rest[1:]
         operators.append(parse_operator(op1_exe, op1_args))
 
-        # Op 2
         if args.Nstages == 2:
             op2_exe = rest[0]; rest = rest[1:]
             op2_args = []
@@ -121,9 +120,22 @@ def main():
         rest = rest[2:]
         
         # Flags
-        exactly_once = rest[0] == "true"
-        autoscale = rest[1] == "true"
-        input_rate = int(rest[2])
+        # 默认值
+        exactly_once = False
+        autoscale = False
+        input_rate = 1000
+        lw = None
+        hw = None
+
+        if len(rest) >= 3:
+            exactly_once = rest[0].lower() == "true"
+            autoscale = rest[1].lower() == "true"
+            input_rate = int(rest[2])
+        
+        # --- 修复: 解析 LW 和 HW ---
+        if len(rest) >= 5:
+            lw = int(rest[3])
+            hw = int(rest[4])
         
         job = {
             "command": "SUBMIT_JOB",
@@ -135,7 +147,7 @@ def main():
             "exactly_once": exactly_once,
             "autoscale_enabled": autoscale,
             "input_rate": input_rate,
-            "LW": None, "HW": None
+            "LW": lw, "HW": hw # 现在这里会使用解析出的值
         }
         print("Submitting Job...")
         send_msg_to_leader(job)
