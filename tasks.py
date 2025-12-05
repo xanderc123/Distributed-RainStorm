@@ -116,7 +116,7 @@ class SourceProcess(multiprocessing.Process):
 
 
 class TaskProcess(multiprocessing.Process):
-    def __init__(self, task_id, operator, port, log_dir, next_stage_tasks=None, ag_column=None, dest_filename=None):
+    def __init__(self, task_id, operator, port, log_dir, next_stage_tasks=None, ag_column=None, dest_filename=None, shared_counter=None):
         super().__init__()
         self.task_id = task_id
         self.operator = operator
@@ -131,6 +131,7 @@ class TaskProcess(multiprocessing.Process):
         
         # State will be initialized in run() to ensure process-safety
         self.state = {} 
+        self.shared_counter = shared_counter # multiprocessing.Value
 
     def log(self, msg):
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -223,6 +224,8 @@ class TaskProcess(multiprocessing.Process):
         except Exception as e:
             self.log(f"FATAL: Could not bind to port {self.port}: {e}")
             return
+        local_count = 0
+        last_flush_time = time.time()
 
         while True:
             try:
@@ -231,6 +234,11 @@ class TaskProcess(multiprocessing.Process):
                 conn.close()
 
                 if data:
+                    
+                    if self.shared_counter:
+                        with self.shared_counter.get_lock():
+                            self.shared_counter.value += 1
+
                     parts = data.split(",", 1)
                     if len(parts) < 2: 
                         continue

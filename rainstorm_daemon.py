@@ -68,10 +68,35 @@ class RainstormLeader:
             elif cmd == "TASK_FAILED": # <-- New: Handle failure report
                 self.handle_task_failure(msg)
                 conn.sendall("OK".encode())
+            elif cmd == "UPDATE_RATES":
+                self.handle_rate_updates(msg.get("updates"))
+
         except Exception as e:
             print(f"Error: {e}")
         finally:
             conn.close()
+   
+    # 新增处理函数
+    def handle_rate_updates(self, updates):
+        # Demo 要求: "Every second, log the tuples/sec processing rate at each task"
+        # 我们可以直接打印，或者存起来每秒统一打。为了简单，收到就打，或者在这里更新内存。
+        timestamp = time.strftime("%H:%M:%S")
+        for u in updates:
+            tid = u["task_id"]
+            rate = u["rate"]
+            # 找到 Task 的更多信息以便打印 (如 VM)
+            vm = "Unknown"
+            with self.lock:
+                for t in self.tasks:
+                    if t["task_id"] == tid:
+                        vm = t["vm"]
+                        # 更新任务的当前速率 (为 AutoScaling 做准备)
+                        t["current_rate"] = rate 
+                        break
+            
+            # 打印日志 [Demo Requirement]
+            # 格式: [RateLog] Task <ID> on <VM>: <Rate> tuples/sec
+            self.log(f"[RateLog] Task {str(tid)[:8]}.. on {vm}: {rate:.2f} tuples/sec")
 
     def handle_update_pid(self, msg):
         with self.lock:
@@ -262,19 +287,30 @@ class RainstormWorker:
 
     def handle_start_task(self, info):
         tid = info["task_id"]
-        # If exists and alive, update routing
-        if tid in self.running_processes and self.running_processes[tid].is_alive():
-            self.running_processes[tid].next_stage_tasks = info.get("next_stage_tasks")
+        if tid in self.running_processes and self.running_processes[tid]["process"].is_alive():
+            # Update routing only
+            self.running_processes[tid]["process"].next_stage_tasks = info.get("next_stage_tasks")
             return
+
+        # 创建共享计数器 (类型 'i' 为整数, 初始值 0)
+        import multiprocessing
+        counter = multiprocessing.Value('i', 0)
 
         t = TaskProcess(
             tid, info["operator"], info["port"], ".", 
-            info.get("next_stage_tasks"), info.get("ag_column"), info.get("dest_filename")
+            info.get("next_stage_tasks"), info.get("ag_column"), info.get("dest_filename"),
+            shared_counter=counter # 传入计数器
         )
         t.start()
-        self.running_processes[tid] = t
         
-        # Report PID
+        # 保存 Process 和 Counter，以及上一次的统计值
+        self.running_processes[tid] = {
+            "process": t,
+            "counter": counter,
+            "last_count": 0,
+            "last_time": time.time()
+        }
+        
         threading.Thread(target=self.report_pid, args=(tid, t.pid, t.log_file)).start()
 
     def report_pid(self, tid, pid, logfile):
@@ -286,21 +322,50 @@ class RainstormWorker:
         except: pass
 
     def monitor_processes(self):
-        """Continuously checks if any task process has died unexpectedly."""
         while True:
-            time.sleep(1)
-            # Create a list to modify to avoid runtime error during iteration
-            for tid, process in list(self.running_processes.items()):
-                if not process.is_alive():
-                    # It's dead!
-                    exitcode = process.exitcode
-                    self.log(f"[Monitor] Task {tid} (PID {process.pid}) died with exitcode {exitcode}")
-                    
-                    # Remove from local list so we don't report it twice
+            time.sleep(1.0) # Demo 要求每秒记录
+            
+            # 收集本节点所有任务的速率
+            updates = []
+            
+            for tid, info in list(self.running_processes.items()):
+                proc = info["process"]
+                if not proc.is_alive():
+                    self.log(f"[Monitor] Task {tid} died.")
                     del self.running_processes[tid]
-                    
-                    # Report to Leader
                     self.report_failure(tid)
+                    continue
+                
+                # 计算速率
+                with info["counter"].get_lock():
+                    curr_val = info["counter"].value
+                
+                now = time.time()
+                delta_count = curr_val - info["last_count"]
+                delta_time = now - info["last_time"]
+                
+                rate = 0.0
+                if delta_time > 0:
+                    rate = delta_count / delta_time
+                
+                # 更新历史
+                info["last_count"] = curr_val
+                info["last_time"] = now
+                
+                updates.append({"task_id": tid, "rate": rate})
+            
+            # 批量发送给 Leader
+            if updates:
+                self.send_rates_to_leader(updates)
+
+    def send_rates_to_leader(self, updates):
+        try:
+            msg = {"command": "UPDATE_RATES", "updates": updates}
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((self.leader_ip, 9100))
+            s.sendall(json.dumps(msg).encode())
+            s.close()
+        except: pass
 
     def report_failure(self, tid):
         self.log(f"[Monitor] Reporting failure of Task {tid} to Leader")
