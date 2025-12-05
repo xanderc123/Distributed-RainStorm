@@ -3,7 +3,9 @@ import sys
 import socket
 import json
 
-VALID_OPS = {"transform", "filter", "aggregate"}
+# --- 修改 1: 添加 "identity" ---
+VALID_OPS = {"transform", "filter", "aggregate", "identity"}
+
 LEADER_IP = "fa25-cs425-9801.cs.illinois.edu"
 LEADER_PORT = 9100
 WORKER_PORT = 9200
@@ -12,6 +14,12 @@ def parse_operator(op_exe, op_args_list):
     if op_exe not in VALID_OPS:
         print(f"Error: invalid operator '{op_exe}'.")
         sys.exit(1)
+    
+    # --- 修改 2: 处理 identity ---
+    if op_exe == "identity":
+        # Identity 不需要任何参数，直接返回
+        return {"exe": op_exe, "args": None}
+
     if op_exe == "aggregate":
         return {"exe": op_exe, "args": int(op_args_list[0])}
     if op_exe == "filter":
@@ -37,7 +45,7 @@ def send_msg_to_leader(msg):
         s.close()
         return json.loads(reply_data.decode())
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error connecting to Leader: {e}")
         return None
 
 def send_msg_to_worker(vm_ip, msg):
@@ -49,7 +57,7 @@ def send_msg_to_worker(vm_ip, msg):
         s.close()
         return json.loads(reply)
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"Error connecting to Worker {vm_ip}: {e}")
         return None
 
 def print_task_table(tasks):
@@ -87,40 +95,60 @@ def main():
         print("Kill command sent.")
 
     else:
-        # SUBMIT JOB PARSING
+        try:
+            int(cmd)
+        except ValueError:
+            print(f"Unknown command: {cmd}")
+            sys.exit(1)
+
         parser = argparse.ArgumentParser()
         parser.add_argument("Nstages", type=int)
         parser.add_argument("Ntasks_per_stage", type=int)
         parser.add_argument("rest", nargs=argparse.REMAINDER)
         
-        try:
-            args = parser.parse_args(sys.argv[1:])
-        except:
-            return
+        args = parser.parse_args(sys.argv[1:])
 
         operators = []
         rest = args.rest
         
+        # 解析 Operator 1
+        if not rest:
+            print("Error: Missing operators")
+            sys.exit(1)
+
         op1_exe = rest[0]; rest = rest[1:]
         op1_args = []
-        if op1_exe != "aggregate":
+        
+        # --- 修改 3: Identity/Aggregate 只需要解析 exe 不需要后面跟 args (或者可以跟空字符串占位) ---
+        # 你的命令是: identity "" ...
+        # aggregate 后面跟了 6
+        # filter 后面跟了 "Sign"
+        if op1_exe == "identity":
+             # 如果命令行传了 "" 占位符，我们需要把它消耗掉，以免错位
+             if rest and rest[0] == "":
+                 rest = rest[1:]
+             # 如果不是空串，说明后面直接跟的是 file，不用管，parse_operator 会处理 args=None
+        elif op1_exe != "aggregate":
              op1_args.append(rest[0]); rest = rest[1:]
         else:
              op1_args.append(rest[0]); rest = rest[1:]
+
         operators.append(parse_operator(op1_exe, op1_args))
 
+        # 解析 Operator 2 (如果 Nstages=2)
         if args.Nstages == 2:
             op2_exe = rest[0]; rest = rest[1:]
             op2_args = []
-            op2_args.append(rest[0]); rest = rest[1:]
+            if op2_exe == "identity": # 一般不会作为 Stage 2，但为了健壮性
+                 if rest and rest[0] == "": rest = rest[1:]
+            else:
+                 op2_args.append(rest[0]); rest = rest[1:]
             operators.append(parse_operator(op2_exe, op2_args))
 
         hydfs_src = rest[0]
         hydfs_dest = rest[1]
         rest = rest[2:]
         
-        # Flags
-        # 默认值
         exactly_once = False
         autoscale = False
         input_rate = 1000
@@ -132,7 +160,6 @@ def main():
             autoscale = rest[1].lower() == "true"
             input_rate = int(rest[2])
         
-        # --- 修复: 解析 LW 和 HW ---
         if len(rest) >= 5:
             lw = int(rest[3])
             hw = int(rest[4])
@@ -147,7 +174,7 @@ def main():
             "exactly_once": exactly_once,
             "autoscale_enabled": autoscale,
             "input_rate": input_rate,
-            "LW": lw, "HW": hw # 现在这里会使用解析出的值
+            "LW": lw, "HW": hw
         }
         print("Submitting Job...")
         send_msg_to_leader(job)

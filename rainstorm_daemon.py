@@ -406,11 +406,15 @@ class RainstormWorker:
 
     def handle_start_task(self, info):
         tid = info["task_id"]
-        if tid in self.running_processes and self.running_processes[tid]["process"].is_alive():
-            # Update routing only
-            self.running_processes[tid]["process"].next_stage_tasks = info.get("next_stage_tasks")
-            return
-
+        
+        # --- 优化：防止重复启动 ---
+        if tid in self.running_processes:
+            entry = self.running_processes[tid]
+            # 如果进程还活着，或者刚启动(counter存在)，就只更新路由
+            if entry.get("process") and entry["process"].is_alive():
+                self.log(f"[Info] Task {tid} already running. Updating routing only.")
+                entry["process"].next_stage_tasks = info.get("next_stage_tasks")
+                return
         # 创建共享计数器 (类型 'i' 为整数, 初始值 0)
         import multiprocessing
         counter = multiprocessing.Value('i', 0)
