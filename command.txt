@@ -1,9 +1,5 @@
-# 杀光旧进程
-pkill -9 -f rainstorm
-pkill -9 -f python3
-
-# 清理旧日志 (方便观察)
-rm -f leader.log worker.log task_*.log
+pkill -9 -f rainstorm; pkill -9 -f python3
+rm -f leader.log worker.log task_*.log leader_console.log worker_console.log source_*.log
 
 nohup python3 membership.py --port 9000 --introducer fa25-cs425-9801.cs.illinois.edu:9000 --mode pingack --drop 0.0 --t_fail 2.5 --t_suspect 1.9 --t_cleanup 2 > membership_bg.log 2>&1 &
 
@@ -29,3 +25,35 @@ python3 hydfs_client.py --hosts hosts.txt ls output_test.txt
 python3 rainstorm_client.py 2 2 filter "Sign" aggregate 6 dataset1.csv output_agg_.txt false false 1000
 
 cat DFS/output_agg.txt/* | tail -n 20
+
+Test0：
+python3 rainstorm_client.py 1 3 identity "" dataset1.csv output_test0.txt true false 100
+# 1. 检查速率 (运行中)
+tail -f leader.log
+# 2. 检查行数 (运行结束后, 预期差值为 1)
+wc -l dataset1.csv
+cat DFS/output_test0.txt/* | wc -l
+
+Test1:
+python3 rainstorm_client.py 2 3 filter "Sign" aggregate 6 dataset1.csv output_test1.txt true false 50
+# 1. 查看 RainStorm 结果 (看文件末尾)
+cat DFS/output_test1.txt/* | tail -n 20
+# 2. 运行 Python 脚本生成标准答案进行对比
+python3 -c "import csv, sys; [print(next(csv.reader([line]))[6]) for line in sys.stdin if 'Sign' in line]" < dataset1.csv | sort | uniq -c
+
+Test2：
+python3 rainstorm_client.py 2 3 filter "Sign" aggregate 6 dataset1.csv output_test2.txt true false 50
+
+python3 rainstorm_client.py list_tasks
+
+python3 rainstorm_client.py kill_task <VM_HOSTNAME> <PID>
+
+tail -f leader.log
+# 看到 [Recovery] Restarting Task... 即成功
+
+Test 3: Autoscaling
+python3 rainstorm_client.py 2 1 filter "Sign" transform "cut1-3" dataset2.csv output_test3.txt false true 1000 2 5
+tail -f leader.log
+tail -f worker.log
+ls -lh DFS/
+ps -ef | grep rainstorm

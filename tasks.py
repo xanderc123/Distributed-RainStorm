@@ -214,9 +214,8 @@ class TaskProcess(multiprocessing.Process):
         while True:
             try:
                 conn, addr = server.accept()
-                # 优化: 尽量一次读取多点数据，或者不立即关闭
                 data = conn.recv(65535).decode("utf-8").strip()
-                conn.close() # 目前必须 Close，因为上游是短连接
+                conn.close() # 
 
                 if data:
                     if self.shared_counter:
