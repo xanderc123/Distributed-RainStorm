@@ -31,7 +31,7 @@ pkill -f membership.py
 # [On VM1] Start the Leader process
 nohup python3 rainstorm_daemon.py --mode leader --logfile leader.log > leader_console.log 2>&1 &
 
-# [On VM1, VM2, VM3, VM4] Start the Worker process (VM1 runs both)
+# [On VM1, VM2, VM3, VM4,VM5,....VM10] Start the Worker process (VM1 runs both)
 nohup python3 rainstorm_daemon.py --mode worker --logfile worker.log > worker_console.log 2>&1 &
 
 # (Emergency) Kill Daemon only
