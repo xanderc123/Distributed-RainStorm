@@ -116,23 +116,30 @@ class SourceProcess(multiprocessing.Process):
             data_tuple = f"{self.filepath}:{idx}, {line.strip()}"
             task = self.tasks[idx % len(self.tasks)]
             
-            s = self.get_socket(task["vm"], task["port"])
-            if s:
-                try:
-                    s.sendall(data_tuple.encode() + b"\n")
-                    self.log_sent_tuple(data_tuple)
-                except Exception as e:
-                    self.log(f"Send Error: {e}")
-                    if (task["vm"], task["port"]) in self.sockets:
-                        del self.sockets[(task["vm"], task["port"])]
-            
-            # --- 修复点: 只有 s 存在时才关闭 ---
-            if s:
-                try:
-                    s.close()
-                except: pass
+            # --- Try infinitely ---
+            sent = False
+            while not sent:
+                s = self.get_socket(task["vm"], task["port"])
+                if s:
+                    try:
+                        s.sendall(data_tuple.encode() + b"\n")
+                        self.log_sent_tuple(data_tuple)
+                        sent = True # 发送成功，跳出循环
+                    except Exception:
+                        # 发送失败，移除连接，下次循环重试
+                        if (task["vm"], task["port"]) in self.sockets:
+                            del self.sockets[(task["vm"], task["port"])]
+                        try: s.close()
+                        except: pass
                 
+                if not sent:
+                    
+                    time.sleep(0.1) 
+            
             if (task["vm"], task["port"]) in self.sockets:
+                s = self.sockets[(task["vm"], task["port"])]
+                try: s.close()
+                except: pass
                 del self.sockets[(task["vm"], task["port"])]
             # ----------------------------------
 
@@ -379,14 +386,17 @@ class TaskProcess(multiprocessing.Process):
         except: return None
 
     def forward_tuple(self, line, dest):
-        # 暂时使用短连接以保证稳定性，直到全链路支持长连接
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.connect((dest["vm"], dest["port"]))
-            s.sendall(line.encode())
-            s.close()
-        except Exception as e:
-            self.log(f"Routing error: {e}")
+        sent = False
+        while not sent:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.connect((dest["vm"], dest["port"]))
+                s.sendall(line.encode())
+                s.close()
+                sent = True
+            except Exception:
+                # 下游挂了，等待 0.1秒后重试，直到它复活
+                time.sleep(0.1)
 
     def transform_operator(self, line):
         if self.operator["exe"] == "transform":

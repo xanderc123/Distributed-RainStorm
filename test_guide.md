@@ -28,8 +28,9 @@ pkill -f membership.py
 ### 3. Start RainStorm Cluster
 
 ```bash
-# [On VM1] Start the Leader process
+# [On VM1] Start the Leader and worker process
 nohup python3 rainstorm_daemon.py --mode leader --logfile leader.log > leader_console.log 2>&1 &
+nohup python3 rainstorm_daemon.py --mode worker --logfile worker.log > worker_console.log 2>&1 &
 
 # [On VM1, VM2, VM3, VM4,VM5,....VM10] Start the Worker process (VM1 runs both)
 nohup python3 rainstorm_daemon.py --mode worker --logfile worker.log > worker_console.log 2>&1 &
@@ -70,6 +71,9 @@ cat DFS/output_test1.txt/* | tail -n 20
 
 # 2. Verify against Ground Truth (Run Python script to calculate locally)
 python3 -c "import csv, sys; [print(next(csv.reader([line]))[6]) for line in sys.stdin if 'Sign' in line]" < dataset1.csv | sort | uniq -c
+
+# Extract final counts for comparison
+cat DFS/output_test1.txt/* | awk -F, '{print $1}' | sort | uniq -c > result_golden.log
 ```
 
 ## 🧪 Phase 4: Test 2 - Fault Tolerance (Kill Task)
@@ -84,11 +88,14 @@ python3 rainstorm_client.py 2 3 filter "Sign" aggregate 6 dataset1.csv output_te
 python3 rainstorm_client.py list_tasks
 
 # 3. Kill the specific task (Replace <VM_HOSTNAME> and <PID> with actual values)
-python3 rainstorm_client.py kill_task <VM_HOSTNAME> <PID>
+ python3 rainstorm_client.py kill_task fa25-cs425-980 PID
+
 
 # 4. Monitor Leader Log for Recovery
 # You should see "[Failure]..." followed by "[Recovery] Restarting Task..."
 tail -f leader.log
+
+cat DFS/output_test2.txt/* | awk -F, '{print $1}' | sort | uniq -c > result_golden.log
 ```
 
 ## 🧪 Phase 5: Test 3 - Autoscaling (App 2)
