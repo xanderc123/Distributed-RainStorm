@@ -423,7 +423,8 @@ class RainstormWorker:
         t = TaskProcess(
             tid, info["operator"], info["port"], ".", 
             info.get("next_stage_tasks"), info.get("ag_column"), info.get("dest_filename"),
-            shared_counter=counter # 传入计数器
+            shared_counter=counter,
+            failed_task_log_id=info.get("failed_task_log_id") # <--- 必须加上这个！
         )
         t.start()
         

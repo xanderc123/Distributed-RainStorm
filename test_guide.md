@@ -33,7 +33,7 @@ nohup python3 rainstorm_daemon.py --mode leader --logfile leader.log > leader_co
 nohup python3 rainstorm_daemon.py --mode worker --logfile worker.log > worker_console.log 2>&1 &
 
 # [On VM1, VM2, VM3, VM4,VM5,....VM10] Start the Worker process (VM1 runs both)
-nohup python3 rainstorm_daemon.py --mode worker --logfile worker.log > worker_console.log 2>&1 &
+nohup python3 rainstorm_daemon.py --mode worker --logfile worker.log < /dev/null > worker_console.log 2>&1 &
 
 # (Emergency) Kill Daemon only
 pkill -f rainstorm_daemon.py
@@ -63,8 +63,8 @@ cat DFS/output_test0.txt/* | wc -l
 **Goal**: Verify that the logic for filtering and stateful aggregation is correct.
 
 ```bash
-# Submit Job: 2 Stages, 3 Tasks/Stage, Filter "Sign" -> Aggregate Col 6, Rate=50
-python3 rainstorm_client.py 2 3 filter "Sign" aggregate 6 dataset1.csv output_test1.txt true false 50
+# Submit Job: 2 Stages, 3 Tasks/Stage, Filter "Sign" -> Aggregate Col 6python3 rainstorm_client.py 2 3 filter "Sign" aggregate 6 dataset1.csv output_test1.txt true false 50, Rate=50
+
 
 # 1. Verify RainStorm Result (Check the final accumulated counts at the end)
 cat DFS/output_test1.txt/* | tail -n 20
@@ -95,7 +95,8 @@ python3 rainstorm_client.py list_tasks
 # You should see "[Failure]..." followed by "[Recovery] Restarting Task..."
 tail -f leader.log
 
-cat DFS/output_test2.txt/* | awk -F, '{print $1}' | sort | uniq -c > result_golden.log
+cat DFS/output_test2.txt/* | awk -F, '{print $1}' | sort | uniq -c > result_failure.log
+diff result_failure.log result_golden.log
 ```
 
 ## 🧪 Phase 5: Test 3 - Autoscaling (App 2)
