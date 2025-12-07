@@ -1,11 +1,14 @@
 import multiprocessing
 import time
+import hashlib
 import socket
+import threading
 import re
 import csv
 import json
 import struct
 import os
+import pathlib
 
 # --- HyDFS Helper Functions (保持不变) ---
 def send_tcp_request(port, req):
@@ -35,6 +38,9 @@ def append_hydfs_file(filename, content):
         create_req = {"command": "create", "remote_file": filename, "content": content}
         send_tcp_request(9002, create_req)
 
+def compute_tuple_hash(tuple_str: str) -> str:
+    return hashlib.sha1(tuple_str.encode("utf-8")).hexdigest()
+
 # ----------------------------------------------------
 
 class SourceProcess(multiprocessing.Process):
@@ -47,6 +53,15 @@ class SourceProcess(multiprocessing.Process):
         self.running = True
         # --- 优化: Socket 缓存 ---
         self.sockets = {} # Key: (vm, port), Value: socket object
+        # Exactly once
+        self.sent_ids = set()
+        self.sent_log_path = os.path.join(log_dir, "source_sent_ids.log")
+
+        if os.path.exists(self.sent_log_path):
+            with open(self.sent_log_path, "r") as f:
+                for line in f:
+                    self.sent_ids.add(line.strip())
+
 
     def log(self, msg):
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -74,6 +89,14 @@ class SourceProcess(multiprocessing.Process):
             except: pass
         self.sockets.clear()
 
+    def log_sent_tuple(self, tuple_str: str):
+        h = compute_tuple_hash(tuple_str)
+
+        with open(self.sent_log_path, "a") as f:
+            f.write(h + "\n")
+
+        self.sent_ids.add(h)
+
     def run(self):
         self.log(f"SourceProcess started. PID: {os.getpid()}")
         try:
@@ -97,6 +120,7 @@ class SourceProcess(multiprocessing.Process):
             if s:
                 try:
                     s.sendall(data_tuple.encode() + b"\n")
+                    self.log_sent_tuple(data_tuple)
                 except Exception as e:
                     self.log(f"Send Error: {e}")
                     if (task["vm"], task["port"]) in self.sockets:
@@ -120,7 +144,7 @@ class SourceProcess(multiprocessing.Process):
         self.log("SourceProcess finished")
 
 class TaskProcess(multiprocessing.Process):
-    def __init__(self, task_id, operator, port, log_dir, next_stage_tasks=None, ag_column=None, dest_filename=None, shared_counter=None):
+    def __init__(self, task_id, operator, port, log_dir, next_stage_tasks=None, ag_column=None, dest_filename=None, shared_counter=None, failed_task_log_id=None):
         super().__init__()
         self.task_id = task_id
         self.operator = operator
@@ -133,6 +157,163 @@ class TaskProcess(multiprocessing.Process):
         self.state = {} 
         self.shared_counter = shared_counter
         self.sockets = {} # 缓存下游连接
+        # 
+        self.received_ids = set()
+        self.sent_ids = set()
+        self.received_log_path = os.path.join(self.log_dir, f"task_{self.task_id}_received.log")
+        self.sent_log_path = os.path.join(self.log_dir, f"task_{self.task_id}_sent.log")
+        self.received_hydfs_created = False
+        self.sent_hydfs_created = False
+        # To keep track of the last position of the log files
+        self.received_last_pos = 0
+        self.sent_last_pos = 0
+
+        if failed_task_log_id:
+            self.recover_failed_task_log(failed_task_log_id)
+
+    def sync_log_to_hydfs(self, local_path, remote_filename, created_flag_attr, last_pos_attr):
+        """
+        Sync local log to HyDFS without duplicating data.
+        - On first sync: CREATE with entire file content.
+        - On later syncs: APPEND only new content since last sync.
+        """
+
+        if not os.path.exists(local_path):
+            return
+
+        created = getattr(self, created_flag_attr)
+        last_pos = getattr(self, last_pos_attr)
+
+        try:
+            with open(local_path, "r", encoding="utf-8") as f:
+                f.seek(last_pos)
+                new_content = f.read()
+                new_pos = f.tell()
+        except Exception as e:
+            self.log(f"[HydFS Sync] Failed reading {local_path}: {e}")
+            return
+
+        # If no new content and file was already created, skip
+        if created and not new_content:
+            return
+
+        # If first upload (no remote file created)
+        if not created:
+            cmd = "create"
+            content = pathlib.Path(local_path).read_text('utf-8')
+            msg = {
+                "command": "create",
+                "remote_file": remote_filename,
+                "local_file": os.path.basename(local_path),
+                "content": content
+            }
+            self.log(f"[HydFS Sync] CREATE {remote_filename}")
+            resp = send_tcp_request(9002, msg)
+
+            if resp and resp.get("ok"):
+                setattr(self, created_flag_attr, True)
+                setattr(self, last_pos_attr, new_pos)
+                self.log(f"[HydFS Sync] CREATE succeeded for {remote_filename}")
+                return
+            else:
+                self.log(f"[HydFS Sync] CREATE failed for {remote_filename}")
+                return
+
+        # Otherwise append only new content
+        if new_content:
+            msg = {
+                "command": "append",
+                "remote_file": remote_filename,
+                "local_file": os.path.basename(local_path),
+                "content": new_content
+            }
+            self.log(f"[HydFS Sync] APPEND {remote_filename} ({len(new_content)} bytes)")
+            resp = send_tcp_request(9002, msg)
+
+            if resp and resp.get("ok"):
+                setattr(self, last_pos_attr, new_pos)
+                self.log(f"[HydFS Sync] APPEND succeeded for {remote_filename}")
+            else:
+                self.log(f"[HydFS Sync] APPEND failed for {remote_filename}")
+
+    def hydfs_sync_loop(self):
+        """
+        Periodically sync both received and sent logs to HyDFS every 2 seconds.
+        """
+        remote_received = f"task_{self.task_id}_received.log"
+        remote_sent = f"task_{self.task_id}_sent.log"
+
+        while True:
+            try:
+                self.sync_log_to_hydfs(
+                    self.received_log_path,
+                    remote_received,
+                    "received_hydfs_created",
+                    "received_last_pos"
+                )
+
+                self.sync_log_to_hydfs(
+                    self.sent_log_path,
+                    remote_sent,
+                    "sent_hydfs_created",
+                    "sent_last_pos"
+                )
+            except Exception as e:
+                self.log(f"[HydFS Sync] Error: {e}")
+
+            time.sleep(2)
+
+    def recover_failed_task_log(self, failed_task_log_id):
+        """
+        Downloads the logs of the failed task (received + sent) from HyDFS
+        and applies them as the current task's logs.
+        """
+
+        # Remote filenames in HyDFS
+        remote_received = f"task_{failed_task_log_id}_received.log"
+        remote_sent     = f"task_{failed_task_log_id}_sent.log"
+
+        # Local target filenames for THIS task
+        local_received = self.received_log_path
+        local_sent     = self.sent_log_path
+
+        # 1. Retrieve logs from HyDFS
+        rec_content = self.retrieve_hydfs_file(remote_received)
+        sent_content = self.retrieve_hydfs_file(remote_sent)
+
+        # 2. Write them into THIS task’s local logs
+        if rec_content:
+            with open(local_received, "w") as f:
+                f.write(rec_content)
+
+        if sent_content:
+            with open(local_sent, "w") as f:
+                f.write(sent_content)
+
+        # 3. Refresh in-memory ID sets
+        self.received_ids.clear()
+        self.sent_ids.clear()
+
+        if rec_content:
+            for line in rec_content.splitlines():
+                self.received_ids.add(line.strip())
+
+        if sent_content:
+            for line in sent_content.splitlines():
+                self.sent_ids.add(line.strip())
+
+        self.log(f"[Recovery] Restored logs from failed task {failed_task_log_id}")
+
+    def load_id_logs(self):
+        if os.path.exists(self.received_log_path):
+            with open(self.received_log_path, "r") as f:
+                for line in f:
+                    self.received_ids.add(line.strip())
+
+        if os.path.exists(self.sent_log_path):
+            with open(self.sent_log_path, "r") as f:
+                for line in f:
+                    self.sent_ids.add(line.strip())
 
     def log(self, msg):
         timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -198,9 +379,33 @@ class TaskProcess(multiprocessing.Process):
         self.state[agg_key] += 1
         return f"{agg_key}, {self.state[agg_key]}"
 
+    def log_tuple_id(self, tuple_str: str, log_type: str):
+        """
+        log_type: "received" or "sent"
+        """
+        h = compute_tuple_hash(tuple_str)
+
+        if log_type == "received":
+            log_path = self.received_log_path
+            id_set = self.received_ids
+        elif log_type == "sent":
+            log_path = self.sent_log_path
+            id_set = self.sent_ids
+        else:
+            raise ValueError("log_type must be 'received' or 'sent'")
+
+        with open(log_path, "a") as f:
+            f.write(h + "\n")
+
+        id_set.add(h)
+
+        return h
+
     def run(self):
+        self.load_id_logs()
         self.state = {}
         self.log(f"Task Process Started. PID: {os.getpid()}, Port: {self.port}")
+        threading.Thread(target=self.hydfs_sync_loop, daemon=True).start()
 
         server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -218,6 +423,12 @@ class TaskProcess(multiprocessing.Process):
                 conn.close() # 
 
                 if data:
+                    # --- Exactly-once verification ---
+                    h_in = compute_tuple_hash(data)
+                    if h_in in self.received_ids:
+                        continue
+                    self.log_tuple_id(data, "received")
+
                     if self.shared_counter:
                         with self.shared_counter.get_lock():
                             self.shared_counter.value += 1
@@ -248,6 +459,10 @@ class TaskProcess(multiprocessing.Process):
                     if processed_line is None: continue
 
                     self.log(f"[OUTPUT_TUPLE] {processed_line}")
+                    
+                    # Hash and Log sent tuples
+                    h_out = compute_tuple_hash(processed_line)
+                    self.log_tuple_id(h_out, "sent")
 
                     if self.next_stage_tasks:
                         routing_key = key

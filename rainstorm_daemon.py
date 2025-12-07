@@ -127,7 +127,6 @@ class RainstormLeader:
             # Simple Strategy: Restart on the SAME VM first (if node is alive), 
             # or move to another. For Demo "Kill Task", node is alive, so restart on same VM is fastest.
             # But let's rotate to prove we can move it.
-            
             workers = list(self.members)
             if not workers: return
             
@@ -140,6 +139,7 @@ class RainstormLeader:
             target_task["vm"] = new_vm
             target_task["port"] = new_port
             target_task["pid"] = None # Reset
+            target_task["failed_task_log_id"] = failed_task_id
             
             self.send_start_task(target_task)
             
@@ -218,7 +218,8 @@ class RainstormLeader:
         msg = {
             "command": "START_TASK", "task_id": task["task_id"], "stage": task["stage"],
             "port": task["port"], "operator": task["operator"], 
-            "ag_column": task["ag_column"], "dest_filename": task["dest_filename"]
+            "ag_column": task["ag_column"], "dest_filename": task["dest_filename"],
+            "failed_task_log_id": task.get("failed_task_log_id", "")
         }
         if task["stage"] == 1:
             st2 = [t for t in self.tasks if t["stage"]==2]
