@@ -63,7 +63,8 @@ cat DFS/output_test0.txt/* | wc -l
 **Goal**: Verify that the logic for filtering and stateful aggregation is correct.
 
 ```bash
-# Submit Job: 2 Stages, 3 Tasks/Stage, Filter "Sign" -> Aggregate Col 6python3 rainstorm_client.py 2 3 filter "Sign" aggregate 6 dataset1.csv output_test1.txt true false 50, Rate=50
+# Submit Job: 2 Stages, 3 Tasks/Stage, Filter "Sign" -> Aggregate Col 6
+python3 rainstorm_client.py 2 3 filter "Sign" aggregate 6 dataset1.csv output_test1.txt true false 50
 
 
 # 1. Verify RainStorm Result (Check the final accumulated counts at the end)
@@ -75,6 +76,9 @@ python3 -c "import csv, sys; [print(next(csv.reader([line]))[6]) for line in sys
 # Extract final counts for comparison
 cat DFS/output_test1.txt/* | awk -F, '{print $1}' | sort | uniq -c > result_golden.log
 ```
+
+# 只杀 rainstorm，保留 membership
+pkill -9 -f rainstorm_daemon.py; rm -f leader.log worker.log task_*.log; nohup python3 rainstorm_daemon.py --mode worker --logfile worker.log < /dev/null > worker_console.log 2>&1 &
 
 ## 🧪 Phase 4: Test 2 - Fault Tolerance (Kill Task)
 

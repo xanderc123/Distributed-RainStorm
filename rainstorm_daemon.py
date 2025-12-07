@@ -7,6 +7,7 @@ import os
 import signal
 from uuid import uuid4
 from tasks import SourceProcess, TaskProcess
+import multiprocessing
 
 class RainstormLeader:
     def __init__(self, logfile, host="0.0.0.0", port=9100):
@@ -20,6 +21,9 @@ class RainstormLeader:
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.bind(("0.0.0.0", self.port))
         self.lock = threading.Lock() # Protect task list
+       
+        self.manager = multiprocessing.Manager()
+        self.source_tasks = None # 专门给 Source 用的共享列表
 
     def init_log(self):
         open(self.logfile, "w").close()
@@ -145,6 +149,12 @@ class RainstormLeader:
             
             # Important: Update routing for upstream tasks
             self.update_routing_tables()
+            if target_task["stage"] == 1:
+                for i, t in enumerate(self.source_tasks):
+                    if t["task_id"] == target_task["task_id"]:
+                        self.source_tasks[i] = target_task # 更新共享内存
+                        self.log(f"[Leader] Updated Source routing for Task {t['task_id']}")
+                        break
 
     def update_routing_tables(self):
         # Resend start command to all tasks to update their routing maps
@@ -208,9 +218,18 @@ class RainstormLeader:
             self.tasks = new_tasks
             for t in self.tasks: self.send_start_task(t)
         
-        # Start Source
+     # --- 关键修改开始：使用 Shared List ---
+        # 1. 提取 Stage 1 任务
         st0 = [t for t in new_tasks if t["stage"]==1]
-        SourceProcess(src_file, st0, input_rate, ".").start()
+        
+        # 2. 转换为 Manager 管理的共享列表 (这样 Leader 修改它时，Source 也能看到)
+        self.source_tasks = self.manager.list(st0) 
+        
+        # 3. 启动 Source，传入这个共享列表
+        SourceProcess(src_file, self.source_tasks, input_rate, ".").start()
+        # --- 关键修改结束 ---
+
+        # 日志要保留，这是 Demo 要求的
         self.log("[Leader] Job started.")
         self.log("[Leader] Job started with Autoscale=" + str(self.autoscale_enabled))
 
