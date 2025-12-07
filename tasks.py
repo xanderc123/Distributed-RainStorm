@@ -263,17 +263,39 @@ class TaskProcess(multiprocessing.Process):
 
             time.sleep(2)
 
+    def retrieve_hydfs_file(self, remote_filename):
+        """
+        Fetch a remote file from HyDFS using:
+        {'command': 'get', 'remote_file': <filename>}
+        Returns file content as a string, or "" if not found.
+        Logs all events but never logs file content.
+        """
+
+        msg = {
+            "command": "get",
+            "remote_file": remote_filename
+        }
+
+        self.log(f"[HydFS Recovery] Requesting GET for {remote_filename}")
+
+        resp = send_tcp_request(9002, msg)
+
+        if resp and resp.get("ok"):
+            self.log(f"[HydFS Recovery] GET succeeded for {remote_filename}")
+            return resp.get("content", "")
+
+        self.log(f"[HydFS Recovery] GET failed or file missing: {remote_filename}")
+        return ""
+
     def recover_failed_task_log(self, failed_task_log_id):
         """
         Downloads the logs of the failed task (received + sent) from HyDFS
         and applies them as the current task's logs.
         """
 
-        # Remote filenames in HyDFS
         remote_received = f"task_{failed_task_log_id}_received.log"
         remote_sent     = f"task_{failed_task_log_id}_sent.log"
 
-        # Local target filenames for THIS task
         local_received = self.received_log_path
         local_sent     = self.sent_log_path
 
@@ -281,7 +303,7 @@ class TaskProcess(multiprocessing.Process):
         rec_content = self.retrieve_hydfs_file(remote_received)
         sent_content = self.retrieve_hydfs_file(remote_sent)
 
-        # 2. Write them into THIS task’s local logs
+        # 2. Overwrite THIS task’s local logs
         if rec_content:
             with open(local_received, "w") as f:
                 f.write(rec_content)
@@ -289,6 +311,12 @@ class TaskProcess(multiprocessing.Process):
         if sent_content:
             with open(local_sent, "w") as f:
                 f.write(sent_content)
+
+        # 2.5 Update local file-position trackers for sync loop
+        if rec_content:
+            self.received_last_pos = len(rec_content.encode("utf-8"))
+        if sent_content:
+            self.sent_last_pos = len(sent_content.encode("utf-8"))
 
         # 3. Refresh in-memory ID sets
         self.received_ids.clear()
