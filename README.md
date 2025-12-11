@@ -1,200 +1,63 @@
-# MP2 Demo Commands (10 VMs)
+# Distributed-RainStorm ⛈️
 
-This README contains **copy-pasteable** commands to reproduce the demo on 10 VMs (`fa25-cs425-a801` … `fa25-cs425-a810`) with:
+A distributed, fault-tolerant stream processing engine implemented in Python, featuring a custom distributed file system (HyDFS), exactly-once semantics, and dynamic autoscaling.
 
-* UDP **port** `9000` (and `9001` only for the rejoin test)
-* **Introducer**: `fa25-cs425-9801.cs.illinois.edu:9000`
-* Start in **PingAck without Suspicion**, then switch to **Gossip**, then enable **Suspicion**
+## 📖 Overview
 
-> Replace `/path/to/mp2` with your repo path if needed.
-> All `control.py` calls talk to the local control port `9900` on each VM.
+Distributed-RainStorm is a full-stack distributed system built from scratch, inspired by frameworks like Apache Storm and Spark Streaming. It is designed to process unbounded streams of data in real-time across a cluster of commodity machines.
 
----
+Unlike simple prototypes, this system implements a complete distributed stack:
 
-## Prep / Kill (run **on each VM** in its own terminal)
+- **Membership Protocol**: A SWIM-style failure detector to maintain cluster membership.
+- **HyDFS (Hydra Distributed File System)**: A replicated distributed file system for reliable storage.
+- **RainStorm Engine**: A stream processing framework with Leader-Worker architecture.
 
-```bash
-pkill -f "membership.py.*--port 9000" || true
-ss -lnpt | egrep ':9900' || echo 'no control 9900'
-ss -lnup | egrep ':9000' || echo 'no udp 9000'
-ss -lnup | egrep ':9002' || echo 'no file server 9002'
-```
+## 🌟 Key Features
 
----
+### 1. Robust Stream Processing Engine
+**Leader-Worker Architecture**: A centralized Leader manages job scheduling, while Workers execute tasks in parallel processes.
 
-## Test 1 — Join (PingAck, No Suspicion)
+**Flexible Topology**: Supports multi-stage pipelines (Source → Filter → Transform/Aggregate).
 
-### Introducer (vm1 = `fa25-cs425-9801.cs.illinois.edu:9000`)
+**Supported Operators**:
+- **Filter**: Pattern matching (Regex).
+- **Transform**: String manipulation (e.g., custom cut operations).
+- **Aggregate**: Stateful key-value counting.
+- **Identity**: Passthrough for load testing.
 
-```bash
-cd /path/to/mp2
-nohup python3 membership.py \
-  --port 9000 \
-  --introducer fa25-cs425-9801.cs.illinois.edu:9000 \
-  --mode pingack --drop 0.0 --t_fail 2 --t_suspect 1.8 --t_cleanup 2 \
-  > daemon_vm1.log 2>&1 & echo $! > daemon_vm1.pid
-sleep 1
-python3 control.py display_protocol
-python3 control.py list_self
-python3 control.py list_mem
-```
+### 2. Strong Consistency (Exactly-Once Semantics)
+We guarantee that every tuple is processed exactly once, even in the presence of node failures.
 
-### Group A join **simultaneously** (vm2–vm5)
+- **Unique Identification**: Every tuple is assigned a unique SHA1 hash ID.
+- **State Logging**: Task states and processed IDs are periodically synced to HyDFS (Distributed Write-Ahead Log).
+- **Deduplication**: Workers check incoming tuple hashes against their restored state to prevent duplicate processing.
+- **Zero Data Loss**: Upstream tasks utilize an infinite retry mechanism (while not sent) to handle downstream failures, ensuring reliable delivery.
 
-Run on **each** of vm2, vm3, vm4, vm5:
+### 3. Elasticity (Autoscaling)
+The system adapts to workload changes in real-time.
 
-```bash
-cd /path/to/mp2
-nohup python3 membership.py \
-  --port 9000 \
-  --introducer fa25-cs425-9801.cs.illinois.edu:9000 \
-  --mode pingack --drop 0.0 --t_fail 2 --t_suspect 1.8 --t_cleanup 2 \
-  > vm.log 2>&1 & echo $! > vm.pid
-```
+- **Throughput Monitoring**: The Leader aggregates processing rates from all tasks every second.
+- **Dynamic Scaling**:
+  - **Scale Up**: Adds new tasks/workers when the average rate exceeds the High Watermark (HW).
+  - **Scale Down**: Merges tasks when the average rate drops below the Low Watermark (LW).
 
-#### Halfway list (5 members)
+### 4. Distributed Storage (HyDFS)
+A custom DFS that underpins the state management.
 
-On **vm1** and **vm3**:
+- **Sharding & Replication**: Files are split into blocks and replicated across multiple nodes (Ring-based hashing) for high availability.
+- **Consistency**: Supports concurrent appends and atomic reads.
 
-```bash
-python3 control.py list_mem
-```
+## 🏗️ Architecture
 
-### Group B join **20s later** (vm6–vm10)
-
-Run on **each** of vm6, vm7, vm8, vm9, vm10:
-
-```bash
-cd /path/to/mp2
-nohup python3 membership.py \
-  --port 9000 \
-  --introducer fa25-cs425-9801.cs.illinois.edu:9000 \
-  --mode pingack --drop 0.0 --t_fail 2 --t_suspect 1.8 --t_cleanup 2 \
-  > vm.log 2>&1 & echo $! > vm.pid
-```
-
-#### Final list (all 10)
-
-On **vm2** and **vm8**:
-
-```bash
-python3 control.py list_mem
-```
-
----
-
-## Test 2 — Failures (PingAck, No Suspicion)
-
-### Kill two **non-introducer** nodes (example: vm4 & vm7)
-
-On **vm4**:
-
-```bash
-pkill -f "membership.py.*--port 9000"
-```
-
-On **vm7**:
-
-```bash
-pkill -f "membership.py.*--port 9000"
-```
-
-### After 10s, show membership (should list **8**)
-
-On **vm3** and **vm9**:
-
-```bash
-python3 control.py list_mem
-```
-
----
-
-## Test 3 — Switch to Gossip, then Enable Suspicion
-
-### Switch **all alive nodes** (vm1, vm2, vm3, vm5, vm6, vm8, vm9, vm10)
-
-**Switch to Gossip (no suspicion):**
-
-```bash
-python3 control.py switch gossip nosuspect
-python3 control.py display_protocol
-```
-
-**Enable Suspicion:**
-
-```bash
-python3 control.py switch gossip suspect
-python3 control.py display_protocol
-```
-
-**Verify membership unchanged (still 8):**
-
-```bash
-python3 control.py list_mem
-```
-
----
-
-## Test 4 — Failures under Suspicion (Gossip + Suspicion)
-
-### Kill two more **non-introducer** nodes (example: vm5 & vm9)
-
-On **vm5**:
-
-```bash
-pkill -f "membership.py.*--port 9000"
-```
-
-On **vm9**:
-
-```bash
-pkill -f "membership.py.*--port 9000"
-```
-
-> You should see SUSPECT/DELETE immediately on peers’ stdout.
-
-**After 10s, lists should show **6** members:**
-On **vm1** and **vm6**:
-
-```bash
-python3 control.py list_mem
-```
-
----
-
-## Test 5 — Rejoin with a Different ID/Port
-
-### Rejoin one of the failed nodes with a new port (example: vm7 → port **9001**)
-
-On **vm7**:
-
-```bash
-cd /path/to/mp2
-nohup python3 membership.py \
-  --port 9001 \
-  --introducer fa25-cs425-9801.cs.illinois.edu:9000 \
-  --mode gossip --drop 0.0 --t_fail 2 --t_suspect 1.8 --t_cleanup 2 \
-  > vm7_rejoin_p9001.log 2>&1 & echo $! > vm7_rejoin_p9001.pid
-```
-
-**After ~10s, membership should show **7**:**
-On **vm2** and **vm6**:
-
-```bash
-python3 control.py list_mem
-```
-
-**Show vm7’s new id locally:**
-
-```bash
-python3 control.py list_self
-python3 control.py list_mem
-```
-
----
-
-## Cleanup (optional, each VM)
-
-```bash
-pkill -f "membership.py.*--port 9"
-```
+```mermaid
+graph TD
+    User[Client] -->|Submit Job| Leader[RainStorm Leader]
+    Leader -->|Schedule Tasks| W1[Worker Node 1]
+    Leader -->|Schedule Tasks| W2[Worker Node 2]
+    Leader -->|Monitor Rate| Autoscaler[Autoscaling Module]
+    
+    subgraph "Worker Node"
+        W1 -->|Spawn| T1[Task Process A]
+        W1 -->|Spawn| T2[Task Process B]
+        T1 -->|Sync Log| HyDFS[HyDFS Storage]
+    end
